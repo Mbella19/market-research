@@ -58,16 +58,19 @@ async function harvest(
   log: (msg: string, type?: "log" | "warn") => void
 ): Promise<number> {
   const settings = getSettings();
-  const requested = (jsonOrNull<SourceId[]>(scan.sources_json) ?? []).filter((id) =>
+  const requestedIds = (jsonOrNull<SourceId[]>(scan.sources_json) ?? []).filter((id) =>
     connectorById.has(id)
   );
-  const enabled = (requested.length ? requested : CONNECTORS.map((c) => c.id))
-    .map((id) => connectorById.get(id)!)
-    .filter((c) => c.status(settings) === "ready");
+  const wanted = (requestedIds.length ? requestedIds : CONNECTORS.map((c) => c.id)).map(
+    (id) => connectorById.get(id)!
+  );
+  const enabled = wanted.filter((c) => c.status(settings) === "ready");
+  const skipped = wanted.filter((c) => c.status(settings) !== "ready").map((c) => c.id);
 
   const budget = DEPTH_BUDGETS[scan.depth] ?? DEPTH_BUDGETS.standard!;
   const totalWeight = enabled.reduce((s, c) => s + c.weight, 0) || 1;
   const bySource: Record<string, number> = {};
+  const statusBySource: Record<string, "ok" | "empty" | "crashed"> = {};
   for (const c of enabled) bySource[c.id] = 0;
   updateProgress(scan.id, { bySource });
 
@@ -89,8 +92,10 @@ async function harvest(
           if (insertItem(scan.id, item)) inserted++;
         }
         bySource[connector.id] = inserted;
+        statusBySource[connector.id] = inserted > 0 ? "ok" : "empty";
         updateProgress(scan.id, { bySource });
       } catch (err) {
+        statusBySource[connector.id] = "crashed";
         if (!signal.aborted) {
           log(`${connector.id}: harvest crashed (${err instanceof Error ? err.message : err})`, "warn");
         }
@@ -98,9 +103,26 @@ async function harvest(
     })
   );
 
+  // ---- source-health summary: a validation is only as good as its coverage ----
+  const delivered = Object.values(statusBySource).filter((s) => s === "ok").length;
+  const issues = [
+    ...Object.entries(statusBySource)
+      .filter(([, s]) => s !== "ok")
+      .map(([id, s]) => `${id}: ${s === "empty" ? "0 items" : "failed"}`),
+    ...skipped.map((id) => `${id}: no API key`),
+  ];
+  const sourceHealth = { requested: wanted.length, delivered, issues };
+  updateProgress(scan.id, { sourceHealth });
+  log(
+    `source health: ${delivered}/${wanted.length} sources delivered${issues.length ? ` (${issues.join(" · ")})` : ""}`,
+    delivered < Math.ceil(wanted.length / 2) ? "warn" : "log"
+  );
+
   // Near-duplicate removal (crossposts, mirrored complaints) — keep the higher-engagement copy.
+  // Paid-intent hiring posts are exempt: similar wording across job posts is normal,
+  // and each post is an independent buyer.
   const rows = all<{ id: number; title: string; body: string }>(
-    "SELECT id, title, body FROM items WHERE scan_id=? AND (meta_json IS NULL OR meta_json NOT LIKE '%\"kind\":\"market\"%') ORDER BY (score+comments) DESC",
+    "SELECT id, title, body FROM items WHERE scan_id=? AND (meta_json IS NULL OR (meta_json NOT LIKE '%\"kind\":\"market\"%' AND meta_json NOT LIKE '%\"kind\":\"paid-intent\"%')) ORDER BY (score+comments) DESC",
     scan.id
   );
   const dupes = nearDuplicateIndexes(rows.map((r) => `${r.title} ${r.body}`));

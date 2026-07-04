@@ -13,6 +13,8 @@ web/
 # dependencies, tooling, OS noise
 node_modules/
 .claude/
+CLAUDE.md
+graphify-out/
 .DS_Store
 *.log
 nohup.out

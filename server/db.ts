@@ -136,6 +136,16 @@ CREATE TABLE IF NOT EXISTS http_cache (
 );
 `);
 
+// Naive additive migrations: ALTER TABLE fails harmlessly when the column exists.
+function addColumn(table: string, ddl: string): void {
+  try {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+  } catch {
+    /* column already exists */
+  }
+}
+addColumn("clusters", "paid_intent_json TEXT");
+
 export type Row = Record<string, unknown>;
 
 export function all<T = Row>(sql: string, ...params: unknown[]): T[] {

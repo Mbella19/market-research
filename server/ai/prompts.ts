@@ -112,6 +112,9 @@ export function judgePrompt(
     engagement: number;
     voices: number;
     recencyRatio: number;
+    topThreadShare?: number;
+    paidIntentPosts?: number;
+    paidMedianBudgetUsd?: number;
   },
   evidence: JudgeEvidenceInput[]
 ): string {
@@ -121,7 +124,7 @@ export function judgePrompt(
 
 CLUSTER: "${name}"
 SUMMARY: ${summary}
-HARD METRICS: ${JSON.stringify(metrics)} (voices = distinct complainers + total upvotes/comments on the evidence)
+HARD METRICS: ${JSON.stringify(metrics)} (voices = distinct complainers + normalized viral-capped engagement; topThreadShare = fraction of engagement carried by the single biggest thread; paidIntentPosts = hiring posts with real budgets matched to this problem — the strongest willingness-to-pay evidence available)
 
 EVIDENCE (verbatim quotes from real posts): ${JSON.stringify(evidence)}
 
@@ -173,7 +176,7 @@ Produce:
 - targetUser: precise ICP, where they hang out (from the evidence sources).
 - mvpFeatures: 4-6 features for a 4-6 week MVP, each one line, ordered by importance. No auth/billing boilerplate.
 - differentiation: 2-3 sentences vs the market context above (or vs manual workarounds if no products exist).
-- monetization: pricing model + realistic price point with one-line justification.
+- monetization: pricing model + realistic price point, phrased explicitly as a HYPOTHESIS to test (harvested complaints cannot verify prices) with one-line justification.
 - gtm: 3-5 concrete first-100-customers moves tied to WHERE the evidence came from (specific subreddits, HN, app-store keywords...).
 - risks: 2-4 honest risks (platform dependence, incumbent response, thin wallet...).
 - competitors: 2-5 real alternatives from market context/evidence with a one-line note each (empty array if genuinely none visible).

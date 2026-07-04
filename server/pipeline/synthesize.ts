@@ -15,6 +15,7 @@ interface ClusterRow {
   distinct_authors: number;
   platform_list_json: string | null;
   judge_json: string | null;
+  paid_intent_json: string | null;
   demand_score: number;
 }
 
@@ -65,6 +66,7 @@ function evidenceForBrief(clusterId: number): BriefEvidenceInput[] {
 
 export function renderBriefMd(brief: Brief, cluster: ClusterRow, evidence: BriefEvidenceInput[]): string {
   const platforms = jsonOrNull<string[]>(cluster.platform_list_json) ?? [];
+  const paid = jsonOrNull<{ count: number; medianBudgetUsd: number; totalBudgetUsd: number }>(cluster.paid_intent_json);
   const lines: string[] = [
     `# ${brief.title}`,
     ``,
@@ -72,6 +74,17 @@ export function renderBriefMd(brief: Brief, cluster: ClusterRow, evidence: Brief
     ``,
     `**Validated problem:** ${cluster.name}  `,
     `**Demand evidence:** ~${cluster.voices.toLocaleString()} voices · ${cluster.distinct_authors} distinct complainers · ${platforms.length} platforms (${platforms.join(", ")}) · demand score ${cluster.demand_score}/100`,
+    ``,
+    `## Validation ladder`,
+    `What this brief does and does not prove — climb the rungs before betting months on it:`,
+    ``,
+    `- [x] **Online pain validated** — ${cluster.distinct_authors} distinct people across ${platforms.length} platforms describe this problem (linked below)`,
+    paid && paid.count > 0
+      ? `- [x] **Paid intent detected** — ${paid.count} hiring post${paid.count === 1 ? "" : "s"} asking to pay for this${paid.medianBudgetUsd ? ` (median budget ~$${paid.medianBudgetUsd.toLocaleString()})` : ""}`
+      : `- [ ] **Paid intent** — no hiring posts matched this problem in the harvested sources`,
+    `- [ ] **Customer interviews** — talk to 5-10 of the people quoted in the evidence trail`,
+    `- [ ] **Landing-page interest** — test the one-liner against real traffic`,
+    `- [ ] **Pre-orders / pilot payments** — the only rung that proves pricing`,
     ``,
     `## Problem`,
     brief.problem,
@@ -85,7 +98,7 @@ export function renderBriefMd(brief: Brief, cluster: ClusterRow, evidence: Brief
     `## Differentiation`,
     brief.differentiation,
     ``,
-    `## Monetization`,
+    `## Monetization (hypothesis — untested until the pre-order rung)`,
     brief.monetization,
     ``,
     `## Go-to-market (first 100 customers)`,
@@ -123,7 +136,7 @@ export async function generateBrief(
   steer?: string
 ): Promise<{ id: number; title: string }> {
   const cluster = get<ClusterRow>(
-    `SELECT id, scan_id, name, summary, voices, distinct_authors, platform_list_json, judge_json, demand_score
+    `SELECT id, scan_id, name, summary, voices, distinct_authors, platform_list_json, judge_json, paid_intent_json, demand_score
      FROM clusters WHERE id=?`,
     clusterId
   );

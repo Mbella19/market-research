@@ -70,10 +70,21 @@ A cluster is **validated** only when ALL pass (thresholds editable in Settings):
 
 - distinct complainers ≥ **25**
 - platforms ≥ **2**
-- total engagement (upvotes+comments+reactions) ≥ **800**
+- **normalized** engagement ≥ **800**
 - ≥ **30%** of evidence from the last 12 months
 
-**Voices** = distinct complainers + total engagement (each upvote is a person with the problem). Tiers: 🥇 ≥ 5,000 voices & 3+ platforms · 🥈 ≥ 1,500 · 🥉 passes gate. The AI judge can still reject a gate-passer — and its reasons are shown.
+Engagement is *normalized before counting*: platform units are weighted (a GitHub 👍 ≈ 2.5 reddit-upvote equivalents; an X like ≈ 0.4), any single item is winsorized to ≤3× the median (and ≤35% of the cluster), and with 2+ platforms present no single platform may carry >60% of the counted total — one viral thread can no longer validate a cluster by itself. The gate stores the raw total alongside so nothing is hidden.
+
+**Voices** = distinct complainers + normalized engagement. Tiers: 🥇 ≥ 5,000 voices & 3+ platforms · 🥈 ≥ 1,500 · 🥉 passes gate — all labeled "pain validated", deliberately. The AI judge can still reject a gate-passer — and its reasons are shown.
+
+## Paid intent & the validation ladder
+
+Complaints prove pain, not payment. Two mechanisms keep that distinction honest:
+
+- **Paid-intent evidence**: the Reddit connector additionally harvests hiring subreddits (r/forhire, r/slavelabour, …) for `[Hiring]`/`[Task]` posts, parses posted budgets, and matches them to clusters by vocabulary overlap. Matched posts appear as a separate axis (never mixed into engagement), feed 12% of the demand score, and show on the cluster as "paid intent ×N · ~$median".
+- **Validation ladder** on every cluster and brief: ☑ online pain validated → ☑/☐ paid intent detected → ☐ customer interviews → ☐ landing-page interest → ☐ pre-orders. Brief pricing is explicitly labeled a hypothesis; the ladder names the rung that would test it.
+
+Scans also report **source coverage** ("9/11 sources delivered" + what failed) so a validation is never read against silently missing sources, and interrupted scans are marked as such on server restart (Re-analyze resumes from stored items).
 
 ## Layout
 
@@ -89,4 +100,4 @@ data/              SQLite DB + tmp (gitignored)
 
 > **Public repo note:** the published repository contains the server, pipeline, and connectors only — the `web/` frontend, `.env`, and all local data are intentionally excluded.
 
-Handy scripts: `npx tsx server/scripts/probe-connectors.ts [source…]` (live-test connectors), `npx tsx server/scripts/smoke-ai.ts [effort]` (real Codex call).
+Handy scripts: `npx tsx server/scripts/probe-connectors.ts [source…]` (live-test connectors), `npx tsx server/scripts/probe-trends.ts [source…]` (live-test trend sources), `npx tsx server/scripts/smoke-ai.ts [effort]` (real Codex call). `npm test` runs the analytical-core unit suite (budget parsing, engagement normalization/caps, quote verification, dedupe).

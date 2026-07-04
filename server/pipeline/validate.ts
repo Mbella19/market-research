@@ -3,6 +3,8 @@ import { codexJson } from "../ai/codex.ts";
 import { judgePrompt, type JudgeEvidenceInput } from "../ai/prompts.ts";
 import { ZJudge, JJudge } from "../ai/schemas.ts";
 import { nowSec, truncate } from "../lib/text.ts";
+import { normalizeEngagement, paidIntentScore, type PaidIntentSummary } from "../lib/demand.ts";
+import { matchScore, buildVocab } from "../lib/paidintent.ts";
 import { topicTrends } from "../connectors/trends.ts";
 import type { AppSettings } from "../settings.ts";
 import type { QueryPlan } from "../ai/schemas.ts";
@@ -50,12 +52,33 @@ export async function validateClusters(
   log: (msg: string, type?: "log" | "warn") => void,
   onProgress: (judged: number, toJudge: number) => void
 ): Promise<{ validated: number; engine: "ai" | "heuristic" }> {
-  const clusters = all<{ id: number; name: string; summary: string | null }>(
-    "SELECT id, name, summary FROM clusters WHERE scan_id = ?",
+  const clusters = all<{ id: number; name: string; summary: string | null; category: string | null; persona: string | null }>(
+    "SELECT id, name, summary, category, persona FROM clusters WHERE scan_id = ?",
     scanId
   );
   const now = nowSec();
   const yearAgo = now - 365 * 86400;
+
+  // Paid-intent evidence: [Hiring] posts with budgets, matched to clusters by
+  // vocabulary overlap. A separate axis — never mixed into engagement.
+  interface PaidPost {
+    id: number;
+    title: string;
+    body: string;
+    url: string;
+    budgetUsd: number | null;
+  }
+  const paidPosts: PaidPost[] = all<{ id: number; title: string; body: string; url: string; meta_json: string }>(
+    `SELECT id, title, body, url, meta_json FROM items WHERE scan_id=? AND meta_json LIKE '%"kind":"paid-intent"%'`,
+    scanId
+  ).map((r) => ({
+    id: r.id,
+    title: r.title,
+    body: r.body,
+    url: r.url,
+    budgetUsd: jsonOrNull<{ budgetUsd?: number | null }>(r.meta_json)?.budgetUsd ?? null,
+  }));
+  if (paidPosts.length > 0) log(`paid-intent pool: ${paidPosts.length} hiring posts to match against clusters`);
 
   interface Computed {
     id: number;
@@ -65,6 +88,8 @@ export async function validateClusters(
     distinctAuthors: number;
     platforms: string[];
     engagement: number;
+    topItemShare: number;
+    paid: PaidIntentSummary | null;
     recencyRatio: number;
     growth: number;
     gatePassed: boolean;
@@ -77,7 +102,6 @@ export async function validateClusters(
     const evidence = evidenceFor(cluster.id);
     const authors = new Set<string>();
     const platforms = new Set<string>();
-    let engagement = 0;
     let dated = 0;
     let recent = 0;
     const timeline = new Map<string, number>();
@@ -85,7 +109,6 @@ export async function validateClusters(
     for (const ev of evidence) {
       if (ev.author_hash) authors.add(ev.author_hash);
       if (ev.source !== "producthunt") platforms.add(ev.source);
-      engagement += Math.max(0, ev.score) + Math.max(0, ev.comments);
       if (ev.created_utc) {
         dated++;
         if (ev.created_utc >= yearAgo) recent++;
@@ -95,6 +118,29 @@ export async function validateClusters(
         }
       }
     }
+
+    // Normalized + viral/platform-capped engagement (see lib/demand.ts).
+    const eng = normalizeEngagement(
+      evidence.map((ev) => ({ source: ev.source, engagement: Math.max(0, ev.score) + Math.max(0, ev.comments) }))
+    );
+    const engagement = eng.counted;
+
+    // Match paid-intent posts to this cluster (≥2 shared meaningful tokens).
+    const statements = all<{ statement: string }>(
+      `SELECT p.statement FROM cluster_problems cp JOIN problems p ON p.id=cp.problem_id
+       WHERE cp.cluster_id=? LIMIT 12`,
+      cluster.id
+    ).map((r) => r.statement);
+    const vocab = buildVocab([cluster.name, cluster.category ?? "", cluster.persona ?? "", ...statements]);
+    const matched = paidPosts.filter((p) => matchScore(vocab, `${p.title} ${p.body}`) >= 2);
+    const budgets = matched.map((p) => p.budgetUsd).filter((b): b is number => b !== null && b > 0).sort((a, b) => a - b);
+    const paid: PaidIntentSummary | null = matched.length
+      ? {
+          count: matched.length,
+          totalBudgetUsd: budgets.reduce((s, b) => s + b, 0),
+          medianBudgetUsd: budgets.length ? budgets[Math.floor(budgets.length / 2)]! : 0,
+        }
+      : null;
 
     const distinctAuthors = authors.size;
     const voices = distinctAuthors + engagement;
@@ -129,7 +175,7 @@ export async function validateClusters(
       },
       {
         key: "engagement",
-        label: "total engagement",
+        label: "normalized engagement",
         value: engagement,
         threshold: gate.minEngagement,
         pass: engagement >= gate.minEngagement,
@@ -148,7 +194,7 @@ export async function validateClusters(
     const timelineArr = [...timeline.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1));
     run(
       `UPDATE clusters SET distinct_authors=?, platforms=?, platform_list_json=?, engagement=?, voices=?,
-       recency_ratio=?, timeline_json=?, gate_json=? WHERE id=?`,
+       recency_ratio=?, timeline_json=?, gate_json=?, paid_intent_json=? WHERE id=?`,
       distinctAuthors,
       platforms.size,
       JSON.stringify([...platforms]),
@@ -156,7 +202,20 @@ export async function validateClusters(
       voices,
       recencyRatio,
       JSON.stringify(timelineArr),
-      JSON.stringify({ checks, passed: gatePassed }),
+      JSON.stringify({
+        checks,
+        passed: gatePassed,
+        engagementRaw: eng.raw,
+        viralCapApplied: eng.viralCapApplied,
+        platformCapApplied: eng.platformCapApplied,
+        topItemShare: Number(eng.topItemShare.toFixed(2)),
+      }),
+      paid
+        ? JSON.stringify({
+            ...paid,
+            samples: matched.slice(0, 5).map((p) => ({ title: truncate(p.title, 120), budgetUsd: p.budgetUsd, url: p.url })),
+          })
+        : null,
       cluster.id
     );
 
@@ -168,6 +227,8 @@ export async function validateClusters(
       distinctAuthors,
       platforms: [...platforms],
       engagement,
+      topItemShare: eng.topItemShare,
+      paid,
       recencyRatio,
       growth,
       gatePassed,
@@ -210,6 +271,9 @@ export async function validateClusters(
               engagement: c.engagement,
               voices: c.voices,
               recencyRatio: Number(c.recencyRatio.toFixed(2)),
+              topThreadShare: Number(c.topItemShare.toFixed(2)),
+              paidIntentPosts: c.paid?.count ?? 0,
+              paidMedianBudgetUsd: c.paid?.medianBudgetUsd ?? 0,
             },
             evidencePayload
           ),
@@ -245,22 +309,25 @@ export async function validateClusters(
     const platformScore = Math.min(1, c.platforms.length / 4);
     const recencyScore = c.recencyRatio;
     const growthScore = Math.min(1, Math.max(0, c.growth));
+    const paidScore = paidIntentScore(c.paid);
 
     // Recency + growth carry real weight: the user wants what people complain
-    // about NOW and what's rising, not durable-but-stale pain.
+    // about NOW and what's rising, not durable-but-stale pain. Paid intent
+    // (hiring posts with budgets) is the strongest per-unit signal we have.
     let demandScore: number;
     if (judge) {
       demandScore =
         100 *
-        (0.32 * voicesScore +
-          0.13 * platformScore +
-          0.12 * recencyScore +
-          0.13 * growthScore +
-          0.15 * (judge.painIntensity / 10) +
-          0.15 * (judge.wtpEvidence / 10));
+        (0.26 * voicesScore +
+          0.12 * platformScore +
+          0.11 * recencyScore +
+          0.12 * growthScore +
+          0.14 * (judge.painIntensity / 10) +
+          0.13 * (judge.wtpEvidence / 10) +
+          0.12 * paidScore);
     } else {
       demandScore =
-        100 * (0.45 * voicesScore + 0.15 * platformScore + 0.2 * recencyScore + 0.2 * growthScore);
+        100 * (0.4 * voicesScore + 0.14 * platformScore + 0.17 * recencyScore + 0.17 * growthScore + 0.12 * paidScore);
     }
 
     const aiRejected = judge?.verdict === "rejected";

@@ -16,6 +16,15 @@ import { generateTrendAngles } from "./pipeline/trendscout.ts";
 import { onScanEvent } from "./lib/events.ts";
 import { nowSec, truncate } from "./lib/text.ts";
 
+// ---- restart recovery: in-process scans die with the process — say so honestly ----
+const orphaned = run(
+  "UPDATE scans SET status='error', error='interrupted by server restart — use Re-analyze to resume from stored items', finished_at=? WHERE status='running'",
+  nowSec()
+);
+if (orphaned.changes > 0) {
+  console.log(`recovery: marked ${orphaned.changes} orphaned running scan(s) as interrupted`);
+}
+
 const app = Fastify({ logger: false, bodyLimit: 1_000_000 });
 
 // ---------------- health & meta ----------------

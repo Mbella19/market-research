@@ -10,6 +10,7 @@
     "dev:web": "npm --prefix web run dev",
     "build": "npm run typecheck && npm --prefix web run build",
     "start": "NODE_ENV=production tsx server/index.ts",
+    "test": "node --import tsx --test server/tests/*.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit && npm --prefix web run typecheck --if-present"
   },
   "dependencies": {

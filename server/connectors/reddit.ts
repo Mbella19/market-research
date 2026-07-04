@@ -1,6 +1,7 @@
 import type { Connector, HarvestContext, RawItem } from "./types.ts";
 import { fetchText, fetchJson, HttpError } from "../lib/http.ts";
 import { truncate, stripHtml } from "../lib/text.ts";
+import { parseBudget, isHiringPost } from "../lib/paidintent.ts";
 import { XMLParser } from "fast-xml-parser";
 
 /**
@@ -350,8 +351,48 @@ export const reddit: Connector = {
       }
     }
 
+    // ---- paid-intent pass: hiring subreddits, budgets attached ----
+    // Separate evidence class (meta.kind="paid-intent"): a [Hiring] post with a
+    // budget is someone PAYING to make the pain stop — never counted as a
+    // complaint, matched to clusters at validation as the paid-intent axis.
+    const HIRING_SUBS = ["forhire", "slavelabour", "freelance_forhire", "hireawriter"];
+    const paidQueries = [ctx.plan.keywords[0] ?? ctx.topic ?? "", ctx.plan.keywords[1] ?? ""].filter(Boolean);
+    let paidCount = 0;
+    for (const sub of HIRING_SUBS) {
+      if (paidCount >= 40 || ctx.signal?.aborted) break;
+      const drafts =
+        paidQueries.length > 0
+          ? (await Promise.all(paidQueries.map((q) => scrapeQuery("subSearch", ctx, q, sub)))).flat()
+          : await scrapeQuery("subTop", ctx, "", sub); // discovery mode: recent demand across the board
+      for (const d of drafts) {
+        if (paidCount >= 40) break;
+        if (!d.title || seen.has(d.id) || !isHiringPost(d.title)) continue;
+        seen.add(d.id);
+        paidCount++;
+        const budget = parseBudget(`${d.title}\n${d.body}`);
+        items.push({
+          source: "reddit",
+          externalId: d.id,
+          url: d.url,
+          title: d.title,
+          body: d.body,
+          author: d.author,
+          score: d.score,
+          comments: d.comments,
+          createdUtc: d.createdUtc,
+          meta: {
+            kind: "paid-intent",
+            subreddit: sub,
+            budgetUsd: budget?.amountUsd ?? null,
+            budgetKind: budget?.kind ?? null,
+            budgetRaw: budget?.raw ?? null,
+          },
+        });
+      }
+    }
+
     ctx.log(
-      `reddit: collected ${items.length} items (${items.length - commentCount} posts + ${commentCount} comments)${scraperMode ? " (scraper mode)" : ""}`
+      `reddit: collected ${items.length} items (${items.length - commentCount - paidCount} posts + ${commentCount} comments + ${paidCount} paid-intent hiring posts)${scraperMode ? " (scraper mode)" : ""}`
     );
     return items;
   },

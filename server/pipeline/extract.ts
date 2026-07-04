@@ -111,9 +111,11 @@ export async function extractProblems(
   log: (msg: string, type?: "log" | "warn") => void,
   onBatch: (done: number, total: number, problems: number) => void
 ): Promise<{ engine: "ai" | "heuristic" | "mixed"; problems: number }> {
+  // market items = competitor context; paid-intent items = hiring posts.
+  // Neither is a complaint, so neither goes through pain extraction.
   const items = all<ItemRow>(
     `SELECT id, source, title, body, meta_json FROM items
-     WHERE scan_id = ? AND (meta_json IS NULL OR meta_json NOT LIKE '%"kind":"market"%')
+     WHERE scan_id = ? AND (meta_json IS NULL OR (meta_json NOT LIKE '%"kind":"market"%' AND meta_json NOT LIKE '%"kind":"paid-intent"%'))
      ORDER BY (score + comments) DESC`,
     scanId
   );
