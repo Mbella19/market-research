@@ -1,0 +1,30 @@
+{
+  "name": "lodestone",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Evidence-based market research: find real problems with real demand before you build.",
+  "scripts": {
+    "dev": "concurrently -k -n api,web -c blue,magenta \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:server": "tsx watch server/index.ts",
+    "dev:web": "npm --prefix web run dev",
+    "build": "npm run typecheck && npm --prefix web run build",
+    "start": "NODE_ENV=production tsx server/index.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit && npm --prefix web run typecheck --if-present"
+  },
+  "dependencies": {
+    "@fastify/static": "^8.0.4",
+    "fast-xml-parser": "^5.2.5",
+    "fastify": "^5.6.0",
+    "google-play-scraper": "^10.1.1",
+    "youtubei.js": "^15.0.1",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.1",
+    "concurrently": "^9.2.0",
+    "playwright-core": "^1.61.1",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.2"
+  }
+}
