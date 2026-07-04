@@ -7,11 +7,11 @@
   "scripts": {
     "dev": "concurrently -k -n api,web -c blue,magenta \"npm:dev:server\" \"npm:dev:web\"",
     "dev:server": "tsx watch server/index.ts",
-    "dev:web": "npm --prefix web run dev",
-    "build": "npm run typecheck && npm --prefix web run build",
+    "dev:web": "[ -d web ] && npm --prefix web run dev || echo 'web/ not present in this checkout'",
+    "build": "npm run typecheck && { [ -d web ] && npm --prefix web run build || echo 'web/ not present — nothing to build'; }",
     "start": "NODE_ENV=production tsx server/index.ts",
     "test": "node --import tsx --test server/tests/*.test.ts",
-    "typecheck": "tsc -p tsconfig.json --noEmit && npm --prefix web run typecheck --if-present"
+    "typecheck": "tsc -p tsconfig.json --noEmit && { [ -d web ] && npm --prefix web run typecheck || true; }"
   },
   "dependencies": {
     "@fastify/static": "^8.0.4",

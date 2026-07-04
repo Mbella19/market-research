@@ -10,14 +10,13 @@ It is deliberately **not** an idea generator. Every claim traces to quoted, link
 
 ```bash
 npm install
-npm run dev        # API on :5058, UI on http://localhost:5173
+npm run dev:server   # API on http://127.0.0.1:5058
 ```
 
-Production-ish single process (serves the built UI from the API):
+Production mode:
 
 ```bash
-npm run build
-npm start          # http://127.0.0.1:5058
+npm start            # http://127.0.0.1:5058
 ```
 
 ## The AI core
@@ -31,7 +30,7 @@ Lodestone shells out to your **Codex CLI** (`codex exec`, model **gpt-5.5**) as 
 - **brief** (xhigh) — opportunity report: concept, ICP, MVP, differentiation, monetization, GTM, risks, competitors, evidence trail
 - **ask** — "Ask the evidence" Q&A on any cluster, citations included
 
-Per-stage reasoning effort is configurable in **Settings** (default: high for bulk work, xhigh for judging/briefs). If Codex is unavailable (usage limit, logged out), scans **fall back to a labeled heuristic engine** — never silently — and a **Re-analyze** button re-runs stored items through the AI later.
+Per-stage reasoning effort is configurable in **Settings** (default: high for bulk work, xhigh for judging/briefs). If Codex is unavailable (usage limit, logged out), scans **fall back to a labeled heuristic engine** — never silently — and a **Re-analyze** action re-runs stored items through the AI later.
 
 > **Machine-specific workaround:** your `~/.codex/config.toml` contains `service_tier = "priority"`, which codex-cli 0.130.0 can't parse — plain `codex` commands die on startup. Lodestone always invokes `codex exec --ignore-user-config` with explicit flags, so it is immune. (Fix your terminal codex by removing that line or upgrading the CLI.)
 
@@ -93,11 +92,10 @@ server/            Fastify API + pipeline (TypeScript, node:sqlite — zero nati
   ai/              codex runner, prompts, JSON schemas
   connectors/      11 sources + trends
   pipeline/        plan → harvest → extract → cluster → validate → synthesize
-web/               Vite + React 19, light neomorphic design system, framer-motion
 data/              SQLite DB + tmp (gitignored)
 .env               your keys (gitignored)
 ```
 
-> **Public repo note:** the published repository contains the server, pipeline, and connectors only — the `web/` frontend, `.env`, and all local data are intentionally excluded.
+> **Public repo note:** this repository is the backend only — the operator interface (`web/`, local), `.env`, and all data are intentionally excluded and stay private.
 
 Handy scripts: `npx tsx server/scripts/probe-connectors.ts [source…]` (live-test connectors), `npx tsx server/scripts/probe-trends.ts [source…]` (live-test trend sources), `npx tsx server/scripts/smoke-ai.ts [effort]` (real Codex call). `npm test` runs the analytical-core unit suite (budget parsing, engagement normalization/caps, quote verification, dedupe).
