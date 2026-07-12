@@ -4,15 +4,14 @@ import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { TMP_DIR } from "../lib/env.ts";
 import { Semaphore } from "../lib/ratelimit.ts";
+import { redactSecrets } from "../lib/secrets.ts";
 import { getSettings, type Effort } from "../settings.ts";
 
 /**
- * Lodestone's AI engine: shells out to the user's Codex CLI (gpt-5.5).
+ * Lodestone's AI engine: shells out to the user's Codex CLI (GPT-5.6 Sol by default).
  *
- * IMPORTANT: this machine's ~/.codex/config.toml contains `service_tier = "priority"`,
- * which codex-cli 0.130.0 cannot parse — every plain `codex` invocation dies on startup.
- * We therefore ALWAYS pass --ignore-user-config plus explicit -m/-c flags (auth still
- * comes from ~/.codex/auth.json, which is unaffected).
+ * Calls are isolated from machine-specific config with --ignore-user-config;
+ * authentication still comes from the configured Codex home.
  */
 
 export class CodexError extends Error {
@@ -20,7 +19,8 @@ export class CodexError extends Error {
     message: string,
     public detail: string = ""
   ) {
-    super(message);
+    super(redactSecrets(message));
+    this.detail = redactSecrets(detail);
   }
 }
 
@@ -56,6 +56,31 @@ function tripBreaker(reason: string): void {
 
 const semaphore = new Semaphore(2);
 
+/** Codex needs its login and executable path, not the source API credentials. */
+function codexEnvironment(): NodeJS.ProcessEnv {
+  const allow = [
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "CODEX_HOME",
+  ] as const;
+  const out: NodeJS.ProcessEnv = { RUST_LOG: "error", NO_COLOR: "1" };
+  for (const key of allow) {
+    if (process.env[key] !== undefined) out[key] = process.env[key];
+  }
+  return out;
+}
+
 function rand(): string {
   return randomBytes(6).toString("hex");
 }
@@ -87,13 +112,25 @@ async function spawnCodex(opts: CodexCallOpts): Promise<{ text: string; latencyM
   const id = rand();
   const outFile = join(TMP_DIR, `codex-${id}-last.txt`);
   const schemaFile = opts.schema ? join(TMP_DIR, `codex-${id}-schema.json`) : null;
-  if (schemaFile && opts.schema) writeFileSync(schemaFile, JSON.stringify(opts.schema));
+  if (schemaFile && opts.schema) writeFileSync(schemaFile, JSON.stringify(opts.schema), { mode: 0o600 });
 
   const args = [
     "exec",
     "--ignore-user-config",
     "--skip-git-repo-check",
     "--ephemeral",
+    "--disable",
+    "shell_tool",
+    "--disable",
+    "unified_exec",
+    "--disable",
+    "browser_use",
+    "--disable",
+    "computer_use",
+    "--disable",
+    "apps",
+    "--disable",
+    "plugins",
     "-s",
     "read-only",
     "--color",
@@ -103,7 +140,7 @@ async function spawnCodex(opts: CodexCallOpts): Promise<{ text: string; latencyM
     "-c",
     `model_reasoning_effort="${opts.effort}"`,
     "-c",
-    "tools.web_search=false",
+    'web_search="disabled"',
     "-C",
     TMP_DIR,
     "-o",
@@ -122,7 +159,7 @@ async function spawnCodex(opts: CodexCallOpts): Promise<{ text: string; latencyM
 
         const child = spawn(s.ai.bin, args, {
           stdio: ["pipe", "pipe", "pipe"],
-          env: { ...process.env, RUST_LOG: "error", NO_COLOR: "1" },
+          env: codexEnvironment(),
         });
 
         let stdout = "";

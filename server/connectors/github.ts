@@ -10,7 +10,7 @@ interface GhIssue {
   body?: string | null;
   html_url: string;
   comments?: number;
-  reactions?: { total_count?: number };
+  reactions?: { total_count?: number; "+1"?: number };
   created_at?: string;
   user?: { login?: string };
   pull_request?: unknown;
@@ -76,7 +76,9 @@ export const github: Connector = {
             title: issue.title,
             body: truncate(issue.body ?? "", 2400),
             author: issue.user?.login ?? null,
-            score: issue.reactions?.total_count ?? 0,
+            // GitHub's total_count mixes positive and negative reactions.
+            // Only thumbs-up is a defensible positive demand signal.
+            score: issue.reactions?.["+1"] ?? 0,
             comments: issue.comments ?? 0,
             createdUtc: issue.created_at ? Math.floor(Date.parse(issue.created_at) / 1000) : null,
           });

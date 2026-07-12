@@ -121,7 +121,7 @@ export async function extractProblems(
   );
   if (items.length === 0) return { engine: "ai", problems: 0 };
 
-  const batchSize = Math.max(10, settings.ai.extractBatchSize);
+  const batchSize = Math.max(10, Math.min(80, settings.ai.extractBatchSize));
   const batches: ItemRow[][] = [];
   for (let i = 0; i < items.length; i += batchSize) batches.push(items.slice(i, i + batchSize));
 
@@ -155,13 +155,27 @@ export async function extractProblems(
           },
           ZExtract
         );
-        results = data.results;
+        const expected = new Set(batch.map((item) => item.id));
+        const seen = new Set<number>();
+        const valid: ExtractResult[] = [];
+        for (const result of data.results) {
+          if (!expected.has(result.id) || seen.has(result.id)) continue;
+          seen.add(result.id);
+          valid.push(result);
+        }
+        results = valid;
+        if (valid.length !== batch.length) {
+          log(
+            `AI extraction returned ${valid.length}/${batch.length} exact item IDs — missing items use the labeled heuristic fallback`,
+            "warn"
+          );
+        }
         aiBatches++;
       } catch (err) {
         if (signal?.aborted) return;
         const msg = err instanceof CodexError ? `${err.message} ${err.detail}` : String(err);
         // Usage-limit / auth / launch failures affect every future call too.
-        if (/usage limit|401|auth|failed to launch|ENOENT/i.test(msg) || aiBatches === 0) {
+        if (/usage limit|401|403|authentication|unauthorized|failed to launch|ENOENT/i.test(msg)) {
           aiDead = true;
           aiDeadReason = msg.slice(0, 300);
           log(`AI extraction unavailable — switching to heuristic engine (${aiDeadReason})`, "warn");
@@ -173,10 +187,19 @@ export async function extractProblems(
 
     const byId = new Map(batch.map((it) => [it.id, it]));
     if (results) {
+      const returned = new Set(results.map((result) => result.id));
       for (const r of results) {
         const item = byId.get(r.id);
         if (!item) continue;
         insertProblem(scanId, item, r, "ai");
+      }
+      const missing = batch.filter((item) => !returned.has(item.id));
+      if (missing.length > 0) {
+        heuristicBatches++;
+        for (const item of missing) {
+          const fallback = heuristicExtract(item);
+          if (fallback) insertProblem(scanId, item, fallback, "heuristic");
+        }
       }
     } else {
       heuristicBatches++;

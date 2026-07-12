@@ -2,7 +2,7 @@
  * Live probe of every connector with a small fixed plan (no AI involved).
  * Usage: npx tsx server/scripts/probe-connectors.ts [sourceId ...]
  */
-import { CONNECTORS } from "../connectors/index.ts";
+import { CONNECTORS, DEPTH_BUDGETS } from "../connectors/index.ts";
 import type { HarvestContext } from "../connectors/types.ts";
 import { getSettings } from "../settings.ts";
 import type { QueryPlan } from "../ai/schemas.ts";
@@ -26,8 +26,8 @@ const plan: QueryPlan = {
 const only = process.argv.slice(2);
 const settings = getSettings();
 
-// Per-source limits exactly as a Standard-depth scan (budget 550) allocates them.
-const BUDGET = Number(process.env.PROBE_BUDGET ?? 550);
+// Per-source limits exactly as a Standard-depth scan allocates them.
+const BUDGET = Number(process.env.PROBE_BUDGET ?? DEPTH_BUDGETS.standard);
 const totalWeight = CONNECTORS.reduce((s, c) => s + c.weight, 0);
 
 for (const connector of CONNECTORS) {

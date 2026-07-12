@@ -1,8 +1,19 @@
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
+import { chmodSync, existsSync } from "node:fs";
 import { DATA_DIR } from "./lib/env.ts";
 
 export const db = new DatabaseSync(join(DATA_DIR, "lodestone.db"));
+for (const suffix of ["", "-wal", "-shm"]) {
+  const path = join(DATA_DIR, `lodestone.db${suffix}`);
+  if (existsSync(path)) {
+    try {
+      chmodSync(path, 0o600);
+    } catch {
+      /* best effort on non-POSIX filesystems */
+    }
+  }
+}
 
 db.exec(`
 PRAGMA journal_mode = WAL;
@@ -71,6 +82,10 @@ CREATE TABLE IF NOT EXISTS clusters (
   engagement INTEGER NOT NULL DEFAULT 0,
   voices INTEGER NOT NULL DEFAULT 0,
   recency_ratio REAL NOT NULL DEFAULT 0,
+  dated_ratio REAL NOT NULL DEFAULT 0,
+  growth_rate REAL NOT NULL DEFAULT 0,
+  evidence_items INTEGER NOT NULL DEFAULT 0,
+  metrics_version INTEGER NOT NULL DEFAULT 1,
   timeline_json TEXT,
   demand_score REAL NOT NULL DEFAULT 0,
   tier TEXT NOT NULL DEFAULT 'insufficient',
@@ -97,6 +112,7 @@ CREATE TABLE IF NOT EXISTS opportunities (
   brief_json TEXT,
   created_at INTEGER NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_opportunities_cluster ON opportunities(cluster_id);
 
 CREATE TABLE IF NOT EXISTS trends (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -124,6 +140,8 @@ CREATE TABLE IF NOT EXISTS events (
   data_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_events_scan ON events(scan_id);
+CREATE TRIGGER IF NOT EXISTS delete_scan_events
+AFTER DELETE ON scans BEGIN DELETE FROM events WHERE scan_id=OLD.id; END;
 
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
@@ -136,15 +154,28 @@ CREATE TABLE IF NOT EXISTS http_cache (
 );
 `);
 
-// Naive additive migrations: ALTER TABLE fails harmlessly when the column exists.
+// Explicit additive migrations. Unexpected migration failures must stop startup.
 function addColumn(table: string, ddl: string): void {
-  try {
-    db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
-  } catch {
-    /* column already exists */
-  }
+  const column = ddl.trim().split(/\s+/, 1)[0]!;
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  if (columns.some((entry) => entry.name === column)) return;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
 }
 addColumn("clusters", "paid_intent_json TEXT");
+addColumn("clusters", "dated_ratio REAL NOT NULL DEFAULT 0");
+addColumn("clusters", "growth_rate REAL NOT NULL DEFAULT 0");
+addColumn("clusters", "evidence_items INTEGER NOT NULL DEFAULT 0");
+addColumn("clusters", "metrics_version INTEGER NOT NULL DEFAULT 1");
+addColumn("scans", "config_json TEXT");
+addColumn("scans", "pipeline_version INTEGER NOT NULL DEFAULT 1");
+addColumn("scans", "parent_scan_id INTEGER");
+addColumn("trends", "source_count INTEGER NOT NULL DEFAULT 1");
+addColumn("trends", "signal_strength REAL NOT NULL DEFAULT 0");
+addColumn("trends", "metrics_version INTEGER NOT NULL DEFAULT 1");
+
+db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_opportunities_cluster ON opportunities(cluster_id)");
+db.prepare("DELETE FROM http_cache WHERE ts < ?").run(Date.now() - 7 * 86400_000);
+db.exec(`DELETE FROM http_cache WHERE key NOT IN (SELECT key FROM http_cache ORDER BY ts DESC LIMIT 250)`);
 
 export type Row = Record<string, unknown>;
 
@@ -159,6 +190,27 @@ export function get<T = Row>(sql: string, ...params: unknown[]): T | undefined {
 export function run(sql: string, ...params: unknown[]): { changes: number; lastId: number } {
   const r = db.prepare(sql).run(...(params as never[]));
   return { changes: Number(r.changes), lastId: Number(r.lastInsertRowid) };
+}
+
+/** Execute synchronous DB work atomically. Nested transactions are intentionally unsupported. */
+export function transaction<T>(fn: () => T): T {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const result = fn();
+    db.exec("COMMIT");
+    return result;
+  } catch (error) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      /* preserve the original failure */
+    }
+    throw error;
+  }
+}
+
+export function closeDatabase(): void {
+  db.close();
 }
 
 export function jsonOrNull<T>(s: unknown): T | null {

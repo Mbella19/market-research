@@ -1,7 +1,8 @@
 import { EventEmitter } from "node:events";
 import { run } from "../db.ts";
+import { redactSecrets, redactValue } from "./secrets.ts";
 
-export type ScanEventType = "log" | "warn" | "stage" | "progress" | "done" | "error";
+export type ScanEventType = "log" | "warn" | "stage" | "progress" | "done" | "cancelled" | "error";
 
 export interface ScanEvent {
   scanId: number;
@@ -20,7 +21,9 @@ export function emitScanEvent(
   message: string,
   data?: unknown
 ): void {
-  const ev: ScanEvent = { scanId, ts: Date.now(), type, message, data };
+  const safeMessage = redactSecrets(message);
+  const safeData = data === undefined ? undefined : redactValue(data);
+  const ev: ScanEvent = { scanId, ts: Date.now(), type, message: safeMessage, data: safeData };
   // "progress" fires constantly — stream it live but don't spam the event log table.
   if (type !== "progress") {
     run(
@@ -28,8 +31,8 @@ export function emitScanEvent(
       scanId,
       ev.ts,
       type,
-      message,
-      data === undefined ? null : JSON.stringify(data)
+      safeMessage,
+      safeData === undefined ? null : JSON.stringify(safeData)
     );
   }
   bus.emit(`scan:${scanId}`, ev);

@@ -1,5 +1,6 @@
 import { fetchJson, fetchText, HttpError } from "../lib/http.ts";
-import { tokenize, parseCount, nowSec, stripHtml, STOPWORDS } from "../lib/text.ts";
+import { parseCount, nowSec, stripHtml } from "../lib/text.ts";
+import { trendFocusMatches, trendTokens } from "../lib/trendtext.ts";
 import type { AppSettings } from "../settings.ts";
 import { XMLParser } from "fast-xml-parser";
 
@@ -70,22 +71,9 @@ const GENERIC = new Set(
   ).split(" ")
 );
 
-/** Tech-relevant short tokens the generic tokenizer would drop. */
-const KEEP_SHORT = new Set(["ai", "ar", "vr", "ml", "3d", "5g"]);
-
-/** Trend tokenizer: standard tokens PLUS tech short-tokens ("ai agents" must form). */
-function trendToks(s: string): string[] {
-  return s
-    .toLowerCase()
-    .replace(/[^a-z0-9\s'-]/g, " ")
-    .split(/\s+/)
-    .map((t) => t.replace(/^['-]+|['-]+$/g, ""))
-    .filter((t) => KEEP_SHORT.has(t) || (t.length > 2 && t.length < 24 && !STOPWORDS.has(t)));
-}
-
 /** Terms of a title: distinctive unigrams + adjacent bigrams (generic words ride only in bigrams). */
 function trendTerms(title: string): string[] {
-  const toks = trendToks(title);
+  const toks = trendTokens(title);
   const out: string[] = [];
   for (const t of toks) {
     if (t.length >= 4 && !GENERIC.has(t) && !/^\d+$/.test(t)) out.push(t);
@@ -100,12 +88,7 @@ function trendTerms(title: string): string[] {
 }
 
 function focusMatch(ctx: ScoutContext, text: string): boolean {
-  if (!ctx.focus) return true;
-  const focusToks = new Set(tokenize(ctx.focus));
-  if (focusToks.size === 0) return true;
-  const textToks = new Set(tokenize(text));
-  for (const t of focusToks) if (textToks.has(t)) return true;
-  return false;
+  return trendFocusMatches(ctx.focus, text);
 }
 
 // ---------------- GitHub: new repos with abnormal star velocity ----------------
@@ -167,7 +150,7 @@ export async function scoutGithub(ctx: ScoutContext): Promise<TrendSignal[]> {
           label: repo.full_name,
           metric: `★ ${fmt(repo.stargazers_count)} in ${ageDays}d — ${Math.round(velocity)}/day${repo.language ? ` · ${repo.language}` : ""}`,
           url: repo.html_url,
-          strength: Math.min(1, velocity / 40),
+          strength: velocity / (velocity + 30),
           detail: desc,
         });
       }
@@ -270,7 +253,7 @@ export async function scoutHn(ctx: ScoutContext): Promise<TrendSignal[]> {
       label: c.term,
       metric: `${c.n} high-signal stories vs ${c.prevN} in prior ${ctx.windowDays}d (${c.ratio.toFixed(1)}×) · ${fmt(c.points)} pts`,
       url: `https://hn.algolia.com/?q=${encodeURIComponent(c.term)}&type=story&dateRange=pastMonth`,
-      strength: Math.min(1, (c.n / 12) * 0.5 + Math.min(1, c.ratio / 8) * 0.5),
+      strength: 1 - Math.exp(-((c.n / 12) * 0.55 + (c.ratio / 8) * 0.45)),
     });
   }
 
@@ -330,7 +313,7 @@ export async function scoutProducthunt(ctx: ScoutContext): Promise<TrendSignal[]
       label: term,
       metric: `${e.n} of ${entries.length} current launches mention "${term}" (e.g. ${e.sample.slice(0, 60)})`,
       url: `https://www.producthunt.com/search?q=${encodeURIComponent(term)}`,
-      strength: Math.min(1, e.n / 5),
+      strength: e.n / (e.n + 3),
     });
   }
 

@@ -3,7 +3,13 @@ import { getSettings } from "../settings.ts";
 import { codexJson } from "../ai/codex.ts";
 import { trendClassifyPrompt, trendAnglesPrompt, type TrendCandidateInput } from "../ai/prompts.ts";
 import { ZTrendClassify, JTrendClassify, ZTrendAngles, JTrendAngles } from "../ai/schemas.ts";
-import { tokenize, nowSec, truncate } from "../lib/text.ts";
+import { nowSec, truncate } from "../lib/text.ts";
+import {
+  groupTrendSignals,
+  trendCandidateValue,
+  trendMomentum,
+  type TrendCandidate,
+} from "../lib/trendmetrics.ts";
 import { SCOUTS, TREND_SOURCES, type ScoutContext, type TrendSignal, type TrendSourceId } from "../trends/sources.ts";
 
 /**
@@ -42,87 +48,7 @@ export interface TrendPipelineCtx {
   updateProgress: (patch: Record<string, unknown>) => void;
 }
 
-interface Candidate {
-  id: number;
-  label: string;
-  tokens: Set<string>;
-  signals: TrendSignal[];
-}
-
-/** Light stem so "agents"/"agent" group together without a stemming library. */
-function keyTokens(s: string): Set<string> {
-  const out = new Set<string>();
-  for (const t of tokenize(s)) out.add(t.length > 4 && t.endsWith("s") ? t.slice(0, -1) : t);
-  return out;
-}
-
-function containment(a: Set<string>, b: Set<string>): number {
-  const [small, big] = a.size <= b.size ? [a, b] : [b, a];
-  if (small.size === 0) return 0;
-  let shared = 0;
-  let sharedLong = 0;
-  for (const t of small) {
-    if (big.has(t)) {
-      shared++;
-      if (t.length >= 4) sharedLong++;
-    }
-  }
-  return sharedLong > 0 ? shared / small.size : 0;
-}
-
-/** Group cross-source signals into candidate trends (union-find on containment). */
-function groupSignals(signals: TrendSignal[]): Candidate[] {
-  const parent = signals.map((_, i) => i);
-  const find = (i: number): number => (parent[i] === i ? i : (parent[i] = find(parent[i]!)));
-  const union = (a: number, b: number) => {
-    const ra = find(a);
-    const rb = find(b);
-    if (ra !== rb) parent[rb] = ra;
-  };
-
-  const tokens = signals.map((s) => keyTokens(s.key));
-  for (let i = 0; i < signals.length; i++) {
-    for (let j = i + 1; j < signals.length; j++) {
-      if (containment(tokens[i]!, tokens[j]!) >= 0.7) union(i, j);
-    }
-  }
-
-  const byRoot = new Map<number, number[]>();
-  for (let i = 0; i < signals.length; i++) {
-    const r = find(i);
-    const list = byRoot.get(r) ?? [];
-    list.push(i);
-    byRoot.set(r, list);
-  }
-
-  const candidates: Candidate[] = [];
-  let nextId = 1;
-  for (const memberIdx of byRoot.values()) {
-    const members = memberIdx.map((i) => signals[i]!).sort((a, b) => b.strength - a.strength);
-    // Short human terms (hn/gtrends/producthunt/twitter) name the trend better
-    // than repo slugs; fall back to the strongest signal's label.
-    const named = members.find((m) => m.source !== "github") ?? members[0]!;
-    const merged = new Set<string>();
-    for (const i of memberIdx) for (const t of tokens[i]!) merged.add(t);
-    candidates.push({ id: nextId++, label: named.label, tokens: merged, signals: members });
-  }
-  return candidates;
-}
-
-function candidateValue(c: Candidate): number {
-  const spread = new Set(c.signals.map((s) => s.source)).size;
-  return c.signals.reduce((sum, s) => sum + s.strength, 0) + spread;
-}
-
-function momentumOf(c: Candidate): { score: number; status: string; spread: number } {
-  const spread = new Set(c.signals.map((s) => s.source)).size;
-  const best = Math.max(...c.signals.map((s) => s.strength));
-  // Single-source trends cap at 60 — cross-platform confirmation is what
-  // separates "surging" from "one repo went viral".
-  const score = Math.round(100 * (0.6 * best + 0.4 * Math.min(1, (spread - 1) / 2)));
-  const status = score >= 62 ? "surging" : score >= 32 ? "rising" : "early";
-  return { score, status, spread };
-}
+type Candidate = TrendCandidate<TrendSignal>;
 
 interface Classified {
   id: number;
@@ -154,7 +80,7 @@ function heuristicClassify(c: Candidate): Classified {
 async function classifyCandidates(
   candidates: Candidate[],
   ctx: TrendPipelineCtx
-): Promise<{ classified: Classified[]; engine: "ai" | "heuristic" }> {
+): Promise<{ classified: Classified[]; engine: "ai" | "heuristic" | "mixed" }> {
   const settings = getSettings();
   if (!settings.ai.enabled) {
     ctx.log("AI disabled — classifying trends heuristically (labeled)", "warn");
@@ -170,6 +96,8 @@ async function classifyCandidates(
   }));
 
   const out: Classified[] = [];
+  let aiCount = 0;
+  let heuristicCount = 0;
   const batchSize = 20;
   for (let i = 0; i < inputs.length; i += batchSize) {
     if (ctx.signal.aborted) throw new Error("aborted");
@@ -186,15 +114,20 @@ async function classifyCandidates(
         },
         ZTrendClassify
       );
-      const byId = new Map(data.trends.map((t) => [t.id, t]));
+      const byId = new Map<number, (typeof data.trends)[number]>();
+      for (const trend of data.trends) {
+        if (batch.some((input) => input.id === trend.id) && !byId.has(trend.id)) byId.set(trend.id, trend);
+      }
       for (const inp of batch) {
         const t = byId.get(inp.id);
         const cand = candidates.find((c) => c.id === inp.id)!;
-        out.push(
-          t && t.name
-            ? { id: inp.id, name: t.name, category: t.category, summary: t.summary, softwareFit: t.softwareFit, fitReason: t.fitReason }
-            : heuristicClassify(cand)
-        );
+        if (t?.name) {
+          out.push({ id: inp.id, name: t.name, category: t.category, summary: t.summary, softwareFit: t.softwareFit, fitReason: t.fitReason });
+          aiCount++;
+        } else {
+          out.push(heuristicClassify(cand));
+          heuristicCount++;
+        }
       }
       ctx.log(`AI classified ${Math.min(i + batchSize, inputs.length)}/${inputs.length} trend candidates (${(latencyMs / 1000).toFixed(0)}s)`);
     } catch (err) {
@@ -205,11 +138,12 @@ async function classifyCandidates(
       );
       for (const inp of inputs.slice(i)) {
         out.push(heuristicClassify(candidates.find((c) => c.id === inp.id)!));
+        heuristicCount++;
       }
-      return { classified: out, engine: "heuristic" };
+      return { classified: out, engine: aiCount > 0 ? "mixed" : "heuristic" };
     }
   }
-  return { classified: out, engine: "ai" };
+  return { classified: out, engine: heuristicCount > 0 ? "mixed" : "ai" };
 }
 
 function renderAnglesMd(angles: { title: string; oneLiner: string; mvp: string; trendFit: string }[]): string {
@@ -225,6 +159,7 @@ function renderAnglesMd(angles: { title: string; oneLiner: string; mvp: string; 
 /** Generate (or regenerate) build angles for one stored trend. Used by the report stage and the API. */
 export async function generateTrendAngles(trendId: number, signal?: AbortSignal): Promise<string> {
   const settings = getSettings();
+  if (!settings.ai.enabled) throw new Error("AI engine is disabled in Settings — trend angles require it");
   const trend = get<{ id: number; name: string; category: string; summary: string; signals_json: string }>(
     "SELECT id, name, category, summary, signals_json FROM trends WHERE id=?",
     trendId
@@ -304,8 +239,8 @@ export async function runTrendScout(scan: ScanRow, ctx: TrendPipelineCtx): Promi
 
   // ---- 2. classify ----
   ctx.setStage("classify");
-  let candidates = groupSignals(allSignals);
-  candidates.sort((a, b) => candidateValue(b) - candidateValue(a));
+  let candidates = groupTrendSignals(allSignals);
+  candidates.sort((a, b) => trendCandidateValue(b) - trendCandidateValue(a));
   candidates = candidates.slice(0, depth.maxCandidates);
   // Re-id after the cut so AI batches reference a dense range.
   candidates.forEach((c, i) => (c.id = i + 1));
@@ -313,7 +248,7 @@ export async function runTrendScout(scan: ScanRow, ctx: TrendPipelineCtx): Promi
   ctx.log(`grouped into ${candidates.length} candidate trends — classifying (software-only filter)`);
 
   const { classified, engine } = await classifyCandidates(candidates, ctx);
-  if (engine !== "ai") run("UPDATE scans SET ai_mode='heuristic' WHERE id=?", scan.id);
+  run("UPDATE scans SET ai_mode=? WHERE id=?", engine, scan.id);
 
   // ---- 3. rank ----
   ctx.setStage("rank");
@@ -327,7 +262,7 @@ export async function runTrendScout(scan: ScanRow, ctx: TrendPipelineCtx): Promi
       rejected++;
       continue;
     }
-    const { score, status } = momentumOf(cand);
+    const { score, status } = trendMomentum(cand);
     rows.push({ candidate: cand, cls, score, status });
   }
   rows.sort((a, b) => b.score - a.score);
@@ -337,8 +272,9 @@ export async function runTrendScout(scan: ScanRow, ctx: TrendPipelineCtx): Promi
   const trendIds: number[] = [];
   for (const r of rows) {
     const { lastId } = run(
-      `INSERT INTO trends (scan_id, name, category, summary, status, momentum_score, software_fit, fit_reason, signals_json, engine, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO trends (scan_id, name, category, summary, status, momentum_score, software_fit, fit_reason,
+       signals_json, engine, created_at, source_count, signal_strength)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       scan.id,
       r.cls.name,
       r.cls.category,
@@ -347,10 +283,20 @@ export async function runTrendScout(scan: ScanRow, ctx: TrendPipelineCtx): Promi
       r.score,
       r.cls.softwareFit,
       r.cls.fitReason,
-      JSON.stringify(r.candidate.signals.map((s) => ({ source: s.source, label: s.label, metric: s.metric, url: s.url }))),
+      JSON.stringify(r.candidate.signals.map((s) => ({
+        source: s.source,
+        label: s.label,
+        metric: s.metric,
+        url: s.url,
+        strength: Number(s.strength.toFixed(4)),
+        detail: s.detail ?? null,
+      }))),
       engine,
-      nowSec()
+      nowSec(),
+      new Set(r.candidate.signals.map((signal) => signal.source)).size,
+      Number(trendMomentum(r.candidate).strength.toFixed(4))
     );
+    run("UPDATE trends SET metrics_version=2 WHERE id=?", lastId);
     trendIds.push(lastId);
   }
   const surging = rows.filter((r) => r.status === "surging").length;
@@ -358,12 +304,15 @@ export async function runTrendScout(scan: ScanRow, ctx: TrendPipelineCtx): Promi
 
   // ---- 4. report: build angles for the top software-fit trends ----
   ctx.setStage("report");
-  const targets = all<{ id: number; name: string }>(
+  const targets = settings.ai.enabled ? all<{ id: number; name: string }>(
     `SELECT id, name FROM trends WHERE scan_id=?
      ORDER BY (software_fit='strong') DESC, momentum_score DESC LIMIT ?`,
     scan.id,
     Math.max(0, settings.trendAnglesPerScan)
-  );
+  ) : [];
+  if (!settings.ai.enabled && settings.trendAnglesPerScan > 0) {
+    ctx.log("AI disabled — stored trend evidence without drafting build angles", "warn");
+  }
   let drafted = 0;
   ctx.updateProgress({ angles: { done: 0, total: targets.length } });
   for (const t of targets) {

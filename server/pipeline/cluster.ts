@@ -1,4 +1,4 @@
-import { all, run } from "../db.ts";
+import { all, run, transaction } from "../db.ts";
 import { codexJson } from "../ai/codex.ts";
 import { clusterRefinePrompt, type ClusterCandidateInput } from "../ai/prompts.ts";
 import { ZClusterRefine, JClusterRefine } from "../ai/schemas.ts";
@@ -66,9 +66,9 @@ function addToCentroid(c: Candidate, v: Vec): void {
   c.centroidNorm = norm(c.centroid);
 }
 
-const JOIN_THRESHOLD = 0.2;
+const JOIN_THRESHOLD = 0.28;
 const MERGE_THRESHOLD = 0.42;
-const MAX_CANDIDATES = 60;
+const AI_CANDIDATE_BATCH = 40;
 
 export async function clusterProblems(
   scanId: number,
@@ -76,14 +76,14 @@ export async function clusterProblems(
   settings: AppSettings,
   signal: AbortSignal | undefined,
   log: (msg: string, type?: "log" | "warn") => void
-): Promise<{ clusters: number; engine: "ai" | "heuristic" }> {
+): Promise<{ clusters: number; engine: "ai" | "heuristic" | "mixed"; clusteredProblems: number; unclusteredProblems: number }> {
   const problems = all<ProblemRow>(
     `SELECT p.id, p.statement, p.category, p.persona, (i.score + i.comments) AS engagement
      FROM problems p JOIN items i ON i.id = p.item_id
      WHERE p.scan_id = ? ORDER BY engagement DESC`,
     scanId
   );
-  if (problems.length === 0) return { clusters: 0, engine: "heuristic" };
+  if (problems.length === 0) return { clusters: 0, engine: "heuristic", clusteredProblems: 0, unclusteredProblems: 0 };
 
   // ---- TF-IDF vectors over stemmed statement + category unigrams ----
   const docsTerms = problems.map((p) => stemTerms(`${p.statement} ${p.category ?? ""}`));
@@ -151,11 +151,10 @@ export async function clusterProblems(
   // we're over the prompt budget.
   const kept = candidates
     .filter((c): c is Candidate => Boolean(c))
-    .sort((a, b) => b.members.length * 1000 + b.engagement - (a.members.length * 1000 + a.engagement))
-    .slice(0, MAX_CANDIDATES);
+    .sort((a, b) => b.members.length * 1000 + b.engagement - (a.members.length * 1000 + a.engagement));
 
   log(`local clustering: ${kept.length} candidate groups from ${problems.length} problems`);
-  if (kept.length === 0) return { clusters: 0, engine: "heuristic" };
+  if (kept.length === 0) return { clusters: 0, engine: "heuristic", clusteredProblems: 0, unclusteredProblems: problems.length };
 
   const topTerms = (c: Candidate, n: number): string[] =>
     [...c.centroid.entries()]
@@ -187,71 +186,93 @@ export async function clusterProblems(
     engine: "ai" | "heuristic";
   }
   const finals: FinalCluster[] = [];
-  let engine: "ai" | "heuristic" = "heuristic";
+  const quarantinedCandidates = new Set<number>();
+  let engine: "ai" | "heuristic" | "mixed" = "heuristic";
 
   if (settings.ai.enabled) {
-    try {
-      const payload: ClusterCandidateInput[] = kept.map((c, idx) => ({
+    const consumed = new Set<number>();
+    let aiFinals = 0;
+    let aiFailed = false;
+    for (let start = 0; start < kept.length; start += AI_CANDIDATE_BATCH) {
+      if (signal?.aborted) throw new Error("aborted");
+      const indexes = Array.from(
+        { length: Math.min(AI_CANDIDATE_BATCH, kept.length - start) },
+        (_, offset) => start + offset
+      );
+      const payload: ClusterCandidateInput[] = indexes.map((idx) => ({
         id: idx,
-        size: c.members.length,
-        samples: c.members.slice(0, 6).map((i) => problems[i]!.statement.slice(0, 180)),
+        size: kept[idx]!.members.length,
+        samples: kept[idx]!.members.slice(0, 8).map((problemIndex) => problems[problemIndex]!.statement.slice(0, 220)),
       }));
-      const { data } = await codexJson(
-        {
-          task: "cluster-refine",
-          prompt: clusterRefinePrompt(payload, topic),
-          effort: settings.ai.efforts.cluster,
-          schema: JClusterRefine,
-          timeoutMs: 20 * 60_000,
-          signal,
-        },
-        ZClusterRefine
-      );
-      const consumed = new Set<number>();
-      for (const out of data.clusters) {
-        const memberCandidates = out.memberIds.filter(
-          (id) => id >= 0 && id < kept.length && !consumed.has(id)
+      try {
+        const { data } = await codexJson(
+          {
+            task: `cluster-refine(${start + 1}-${start + payload.length})`,
+            prompt: clusterRefinePrompt(payload, topic),
+            effort: settings.ai.efforts.cluster,
+            schema: JClusterRefine,
+            timeoutMs: 20 * 60_000,
+            signal,
+          },
+          ZClusterRefine
         );
-        if (memberCandidates.length === 0) continue;
-        for (const id of memberCandidates) consumed.add(id);
-        const problemIdxs = memberCandidates.flatMap((id) => kept[id]!.members);
-        if (!out.coherent && problemIdxs.length < 3) continue; // drop incoherent small groups
-        const meta = heuristicMeta(kept[memberCandidates[0]!]!);
-        finals.push({
-          memberProblemIds: problemIdxs.map((i) => problems[i]!.id),
-          name: out.name.trim() || topTerms(kept[memberCandidates[0]!]!, 3).join(" · "),
-          summary: out.summary.trim(),
-          category: out.category.trim().toLowerCase() || meta.category,
-          persona: out.persona.trim() || meta.persona,
-          engine: "ai",
-        });
+        for (const out of data.clusters) {
+          const localSeen = new Set<number>();
+          const memberCandidates = out.memberIds.filter((id) => {
+            if (!indexes.includes(id) || consumed.has(id) || localSeen.has(id)) return false;
+            localSeen.add(id);
+            return true;
+          });
+          if (memberCandidates.length === 0) continue;
+          for (const id of memberCandidates) consumed.add(id);
+          const problemIdxs = memberCandidates.flatMap((id) => kept[id]!.members);
+          if (!out.coherent) {
+            for (const id of memberCandidates) quarantinedCandidates.add(id);
+            log(`discarded incoherent AI grouping containing ${problemIdxs.length} problems`, "warn");
+            continue;
+          }
+          const meta = heuristicMeta(kept[memberCandidates[0]!]!);
+          finals.push({
+            memberProblemIds: [...new Set(problemIdxs.map((i) => problems[i]!.id))],
+            name: out.name.trim() || topTerms(kept[memberCandidates[0]!]!, 3).join(" · "),
+            summary: out.summary.trim(),
+            category: out.category.trim().toLowerCase() || meta.category,
+            persona: out.persona.trim() || meta.persona,
+            engine: "ai",
+          });
+          aiFinals++;
+        }
+      } catch (err) {
+        if (signal?.aborted) throw err;
+        aiFailed = true;
+        log(
+          `AI cluster refinement unavailable after candidate ${start} (${err instanceof Error ? err.message.slice(0, 160) : err}) — heuristic naming for the remainder`,
+          "warn"
+        );
+        break;
       }
-      // Candidates the AI didn't place: keep with heuristic naming.
-      kept.forEach((c, idx) => {
-        if (consumed.has(idx)) return;
-        const meta = heuristicMeta(c);
-        finals.push({
-          memberProblemIds: c.members.map((i) => problems[i]!.id),
-          name: topTerms(c, 3).join(" · ") || "unnamed cluster",
-          summary: "",
-          category: meta.category,
-          persona: meta.persona,
-          engine: "heuristic",
-        });
-      });
-      engine = "ai";
-      log(`AI refined ${kept.length} candidates into ${finals.length} clusters`);
-    } catch (err) {
-      if (signal?.aborted) throw err;
-      log(
-        `AI cluster refinement unavailable (${err instanceof Error ? err.message.slice(0, 160) : err}) — heuristic naming`,
-        "warn"
-      );
     }
+    // Candidates omitted by AI or not attempted after a failure remain visible,
+    // but candidates explicitly consumed as incoherent stay quarantined.
+    kept.forEach((candidate, idx) => {
+      if (consumed.has(idx)) return;
+      const meta = heuristicMeta(candidate);
+      finals.push({
+        memberProblemIds: candidate.members.map((i) => problems[i]!.id),
+        name: topTerms(candidate, 3).join(" · ") || "unnamed cluster",
+        summary: "",
+        category: meta.category,
+        persona: meta.persona,
+        engine: "heuristic",
+      });
+    });
+    engine = aiFinals > 0 && (aiFailed || finals.some((final) => final.engine === "heuristic")) ? "mixed" : aiFinals > 0 ? "ai" : "heuristic";
+    log(`AI refinement produced ${aiFinals} coherent clusters from ${kept.length} candidates`);
   }
 
   if (finals.length === 0) {
-    for (const c of kept) {
+    for (const [idx, c] of kept.entries()) {
+      if (quarantinedCandidates.has(idx)) continue;
       const meta = heuristicMeta(c);
       finals.push({
         memberProblemIds: c.members.map((i) => problems[i]!.id),
@@ -264,30 +285,35 @@ export async function clusterProblems(
     }
   }
 
-  // Singletons that even the AI couldn't group are noise unless one thread is huge.
-  const engagementOf = (fc: FinalCluster) => {
-    const idsSet = new Set(fc.memberProblemIds);
-    let sum = 0;
-    for (const p of problems) if (idsSet.has(p.id)) sum += p.engagement;
-    return sum;
-  };
-  const persisted = finals.filter((fc) => fc.memberProblemIds.length >= 2 || engagementOf(fc) >= 150);
+  // Preserve every coherent problem assignment. Singleton clusters stay below
+  // the author/platform gate, but silently discarding them made coverage look
+  // better than it was and prevented later inspection/reclustering.
+  const persisted = finals.filter((cluster) => cluster.memberProblemIds.length > 0);
 
-  // ---- persist ----
-  for (const fc of persisted) {
-    const { lastId } = run(
-      `INSERT INTO clusters (scan_id, name, summary, category, persona, engine) VALUES (?, ?, ?, ?, ?, ?)`,
-      scanId,
-      fc.name.slice(0, 120),
-      fc.summary.slice(0, 800),
-      fc.category.slice(0, 60),
-      fc.persona.slice(0, 120),
-      fc.engine
-    );
-    for (const pid of fc.memberProblemIds) {
-      run("INSERT OR IGNORE INTO cluster_problems (cluster_id, problem_id) VALUES (?, ?)", lastId, pid);
+  // ---- persist atomically ----
+  transaction(() => {
+    for (const fc of persisted) {
+      const { lastId } = run(
+        `INSERT INTO clusters (scan_id, name, summary, category, persona, engine) VALUES (?, ?, ?, ?, ?, ?)`,
+        scanId,
+        fc.name.slice(0, 120),
+        fc.summary.slice(0, 800),
+        fc.category.slice(0, 60),
+        fc.persona.slice(0, 120),
+        fc.engine
+      );
+      for (const pid of fc.memberProblemIds) {
+        run("INSERT OR IGNORE INTO cluster_problems (cluster_id, problem_id) VALUES (?, ?)", lastId, pid);
+      }
     }
-  }
+  });
 
-  return { clusters: persisted.length, engine };
+  const clusteredProblems = new Set(persisted.flatMap((cluster) => cluster.memberProblemIds)).size;
+  log(`cluster coverage: ${clusteredProblems}/${problems.length} extracted problems assigned`);
+  return {
+    clusters: persisted.length,
+    engine,
+    clusteredProblems,
+    unclusteredProblems: Math.max(0, problems.length - clusteredProblems),
+  };
 }

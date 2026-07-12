@@ -4,7 +4,8 @@ import { judgePrompt, type JudgeEvidenceInput } from "../ai/prompts.ts";
 import { ZJudge, JJudge } from "../ai/schemas.ts";
 import { nowSec, truncate } from "../lib/text.ts";
 import { normalizeEngagement, paidIntentScore, type PaidIntentSummary } from "../lib/demand.ts";
-import { matchScore, buildVocab } from "../lib/paidintent.ts";
+import { assignPaidIntentMatches } from "../lib/paidintent.ts";
+import { selectDiverseEvidence } from "../lib/evidence.ts";
 import { topicTrends } from "../connectors/trends.ts";
 import type { AppSettings } from "../settings.ts";
 import type { QueryPlan } from "../ai/schemas.ts";
@@ -45,13 +46,25 @@ function monthKey(sec: number): string {
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
 }
 
+function lastMonthKeys(count: number, nowSecValue: number): string[] {
+  const now = new Date(nowSecValue * 1000);
+  const out: string[] = [];
+  for (let offset = count - 1; offset >= 0; offset--) {
+    const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - offset, 1));
+    out.push(`${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`);
+  }
+  return out;
+}
+
+const COMPARABLE_GROWTH_SOURCES = new Set(["github", "hn", "reddit", "lemmy", "youtube"]);
+
 export async function validateClusters(
   scanId: number,
   settings: AppSettings,
   signal: AbortSignal | undefined,
   log: (msg: string, type?: "log" | "warn") => void,
   onProgress: (judged: number, toJudge: number) => void
-): Promise<{ validated: number; engine: "ai" | "heuristic" }> {
+): Promise<{ validated: number; engine: "ai" | "heuristic" | "mixed" | "none" }> {
   const clusters = all<{ id: number; name: string; summary: string | null; category: string | null; persona: string | null }>(
     "SELECT id, name, summary, category, persona FROM clusters WHERE scan_id = ?",
     scanId
@@ -65,7 +78,11 @@ export async function validateClusters(
     id: number;
     title: string;
     body: string;
+    text: string;
     url: string;
+    budgetAmount: number | null;
+    budgetCurrency: "USD" | "GBP" | "EUR" | null;
+    budgetKind: "fixed" | "hourly" | "monthly" | "weekly" | null;
     budgetUsd: number | null;
   }
   const paidPosts: PaidPost[] = all<{ id: number; title: string; body: string; url: string; meta_json: string }>(
@@ -75,22 +92,69 @@ export async function validateClusters(
     id: r.id,
     title: r.title,
     body: r.body,
+    text: `${r.title} ${r.body.slice(0, 800)}`,
     url: r.url,
+    budgetAmount:
+      jsonOrNull<{ budgetAmount?: number | null; budgetUsd?: number | null }>(r.meta_json)?.budgetAmount ??
+      jsonOrNull<{ budgetUsd?: number | null }>(r.meta_json)?.budgetUsd ??
+      null,
+    budgetCurrency:
+      (jsonOrNull<{ budgetCurrency?: "USD" | "GBP" | "EUR" | null }>(r.meta_json)?.budgetCurrency ??
+        (jsonOrNull<{ budgetUsd?: number | null }>(r.meta_json)?.budgetUsd ? "USD" : null)),
+    budgetKind:
+      jsonOrNull<{ budgetKind?: "fixed" | "hourly" | "monthly" | "weekly" | null }>(r.meta_json)
+        ?.budgetKind ?? null,
     budgetUsd: jsonOrNull<{ budgetUsd?: number | null }>(r.meta_json)?.budgetUsd ?? null,
   }));
   if (paidPosts.length > 0) log(`paid-intent pool: ${paidPosts.length} hiring posts to match against clusters`);
+
+  const statementsByCluster = new Map<number, string[]>();
+  for (const cluster of clusters) {
+    statementsByCluster.set(
+      cluster.id,
+      all<{ statement: string }>(
+        `SELECT p.statement FROM cluster_problems cp JOIN problems p ON p.id=cp.problem_id
+         WHERE cp.cluster_id=? ORDER BY p.id LIMIT 20`,
+        cluster.id
+      ).map((row) => row.statement)
+    );
+  }
+  const paidMatches = assignPaidIntentMatches(
+    clusters.map((cluster) => ({
+      id: cluster.id,
+      text: [
+        cluster.name,
+        cluster.name,
+        cluster.category ?? "",
+        cluster.persona ?? "",
+        ...(statementsByCluster.get(cluster.id) ?? []),
+      ].join(" "),
+    })),
+    paidPosts
+  );
+  const paidByCluster = new Map<number, typeof paidMatches>();
+  for (const match of paidMatches) {
+    const list = paidByCluster.get(match.clusterId) ?? [];
+    list.push(match);
+    paidByCluster.set(match.clusterId, list);
+  }
+  if (paidPosts.length > 0) {
+    log(
+      `paid-intent matching: ${paidMatches.length}/${paidPosts.length} budgeted posts assigned exclusively to ${paidByCluster.size} clusters`
+    );
+  }
 
   interface Computed {
     id: number;
     name: string;
     summary: string;
-    voices: number;
     distinctAuthors: number;
     platforms: string[];
     engagement: number;
     topItemShare: number;
     paid: PaidIntentSummary | null;
     recencyRatio: number;
+    datedRatio: number;
     growth: number;
     gatePassed: boolean;
     checks: GateCheck[];
@@ -104,7 +168,7 @@ export async function validateClusters(
     const platforms = new Set<string>();
     let dated = 0;
     let recent = 0;
-    const timeline = new Map<string, number>();
+    const timeline = new Map(lastMonthKeys(24, now).map((key) => [key, 0]));
 
     for (const ev of evidence) {
       if (ev.author_hash) authors.add(ev.author_hash);
@@ -112,8 +176,8 @@ export async function validateClusters(
       if (ev.created_utc) {
         dated++;
         if (ev.created_utc >= yearAgo) recent++;
-        if (ev.created_utc >= now - 24 * 30 * 86400) {
-          const k = monthKey(ev.created_utc);
+        const k = monthKey(ev.created_utc);
+        if (timeline.has(k)) {
           timeline.set(k, (timeline.get(k) ?? 0) + 1);
         }
       }
@@ -125,37 +189,51 @@ export async function validateClusters(
     );
     const engagement = eng.counted;
 
-    // Match paid-intent posts to this cluster (≥2 shared meaningful tokens).
-    const statements = all<{ statement: string }>(
-      `SELECT p.statement FROM cluster_problems cp JOIN problems p ON p.id=cp.problem_id
-       WHERE cp.cluster_id=? LIMIT 12`,
-      cluster.id
-    ).map((r) => r.statement);
-    const vocab = buildVocab([cluster.name, cluster.category ?? "", cluster.persona ?? "", ...statements]);
-    const matched = paidPosts.filter((p) => matchScore(vocab, `${p.title} ${p.body}`) >= 2);
-    const budgets = matched.map((p) => p.budgetUsd).filter((b): b is number => b !== null && b > 0).sort((a, b) => a - b);
+    // Each budgeted hiring post is assigned to at most one clear best cluster.
+    const matched = paidByCluster.get(cluster.id) ?? [];
+    const comparableFixedUsd = matched
+      .map((match) => match.post)
+      .filter((post) => post.budgetCurrency === "USD" && post.budgetKind === "fixed")
+      .map((post) => post.budgetUsd)
+      .filter((budget): budget is number => budget !== null && budget > 0)
+      .sort((a, b) => a - b);
     const paid: PaidIntentSummary | null = matched.length
       ? {
           count: matched.length,
-          totalBudgetUsd: budgets.reduce((s, b) => s + b, 0),
-          medianBudgetUsd: budgets.length ? budgets[Math.floor(budgets.length / 2)]! : 0,
+          budgetCount: comparableFixedUsd.length,
+          totalBudgetUsd: comparableFixedUsd.reduce((sum, budget) => sum + budget, 0),
+          medianBudgetUsd: comparableFixedUsd.length
+            ? comparableFixedUsd.length % 2
+              ? comparableFixedUsd[Math.floor(comparableFixedUsd.length / 2)]!
+              : Math.round(
+                  (comparableFixedUsd[comparableFixedUsd.length / 2 - 1]! +
+                    comparableFixedUsd[comparableFixedUsd.length / 2]!) /
+                    2
+                )
+            : 0,
         }
       : null;
 
     const distinctAuthors = authors.size;
-    const voices = distinctAuthors + engagement;
-    const recencyRatio = dated > 0 ? recent / dated : 0.5; // neutral when undated
-    // growth: complaints in last 6 months vs the 6 before
+    const recencyRatio = evidence.length > 0 ? recent / evidence.length : 0;
+    const datedRatio = evidence.length > 0 ? dated / evidence.length : 0;
+    // Compare like-for-like sources with approximately complete 12-month access.
     const sixMonthsAgo = now - 182 * 86400;
     const twelveMonthsAgo = now - 365 * 86400;
-    let last6 = 0;
-    let prior6 = 0;
+    const sourceWindows = new Map<string, { last6: number; prior6: number }>();
     for (const ev of evidence) {
-      if (!ev.created_utc) continue;
-      if (ev.created_utc >= sixMonthsAgo) last6++;
-      else if (ev.created_utc >= twelveMonthsAgo) prior6++;
+      if (!ev.created_utc || !COMPARABLE_GROWTH_SOURCES.has(ev.source)) continue;
+      const counts = sourceWindows.get(ev.source) ?? { last6: 0, prior6: 0 };
+      if (ev.created_utc >= sixMonthsAgo) counts.last6++;
+      else if (ev.created_utc >= twelveMonthsAgo) counts.prior6++;
+      sourceWindows.set(ev.source, counts);
     }
-    const growth = prior6 > 0 ? last6 / prior6 - 1 : last6 > 2 ? 0.5 : 0;
+    const comparableGrowth = [...sourceWindows.values()]
+      .filter(({ last6, prior6 }) => last6 + prior6 >= 3)
+      .map(({ last6, prior6 }) => Math.max(-1, Math.min(2, (last6 + 1) / (prior6 + 1) - 1)));
+    const growth = comparableGrowth.length
+      ? comparableGrowth.reduce((sum, value) => sum + value, 0) / comparableGrowth.length
+      : 0;
 
     const gate = settings.gate;
     const checks: GateCheck[] = [
@@ -187,6 +265,13 @@ export async function validateClusters(
         threshold: Math.round(gate.minRecencyRatio * 100),
         pass: recencyRatio >= gate.minRecencyRatio,
       },
+      {
+        key: "dated",
+        label: "dated evidence coverage",
+        value: Math.round(datedRatio * 100),
+        threshold: Math.round(gate.minDatedRatio * 100),
+        pass: datedRatio >= gate.minDatedRatio,
+      },
     ];
     const gatePassed = checks.every((c) => c.pass);
 
@@ -194,18 +279,24 @@ export async function validateClusters(
     const timelineArr = [...timeline.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1));
     run(
       `UPDATE clusters SET distinct_authors=?, platforms=?, platform_list_json=?, engagement=?, voices=?,
-       recency_ratio=?, timeline_json=?, gate_json=?, paid_intent_json=? WHERE id=?`,
+       recency_ratio=?, dated_ratio=?, growth_rate=?, evidence_items=?, metrics_version=2,
+       timeline_json=?, gate_json=?, paid_intent_json=? WHERE id=?`,
       distinctAuthors,
       platforms.size,
       JSON.stringify([...platforms]),
       engagement,
-      voices,
+      distinctAuthors,
       recencyRatio,
+      datedRatio,
+      growth,
+      evidence.length,
       JSON.stringify(timelineArr),
       JSON.stringify({
         checks,
         passed: gatePassed,
         engagementRaw: eng.raw,
+        engagementNormalized: eng.normalized,
+        engagementBySource: eng.bySource,
         viralCapApplied: eng.viralCapApplied,
         platformCapApplied: eng.platformCapApplied,
         topItemShare: Number(eng.topItemShare.toFixed(2)),
@@ -213,7 +304,16 @@ export async function validateClusters(
       paid
         ? JSON.stringify({
             ...paid,
-            samples: matched.slice(0, 5).map((p) => ({ title: truncate(p.title, 120), budgetUsd: p.budgetUsd, url: p.url })),
+            samples: matched.slice(0, 5).map((match) => ({
+              title: truncate(match.post.title, 120),
+              budgetAmount: match.post.budgetAmount,
+              budgetCurrency: match.post.budgetCurrency,
+              budgetKind: match.post.budgetKind,
+              budgetUsd: match.post.budgetUsd,
+              url: match.post.url,
+              matchScore: Number(match.score.toFixed(3)),
+              sharedTerms: match.sharedTerms,
+            })),
           })
         : null,
       cluster.id
@@ -223,13 +323,13 @@ export async function validateClusters(
       id: cluster.id,
       name: cluster.name,
       summary: cluster.summary ?? "",
-      voices,
       distinctAuthors,
       platforms: [...platforms],
       engagement,
       topItemShare: eng.topItemShare,
       paid,
       recencyRatio,
+      datedRatio,
       growth,
       gatePassed,
       checks,
@@ -240,17 +340,14 @@ export async function validateClusters(
   // ---- AI demand judge for gate-passing clusters ----
   const toJudge = computed
     .filter((c) => c.gatePassed)
-    .sort((a, b) => b.voices - a.voices)
+    .sort((a, b) => b.distinctAuthors - a.distinctAuthors)
     .slice(0, settings.judgedClustersPerScan);
-  let engine: "ai" | "heuristic" = "heuristic";
   let judgedCount = 0;
 
   for (const c of toJudge) {
     if (signal?.aborted) throw new Error("aborted");
     if (!settings.ai.enabled) break;
-    const evidencePayload: JudgeEvidenceInput[] = c.evidence
-      .sort((a, b) => b.score + b.comments - (a.score + a.comments))
-      .slice(0, 15)
+    const evidencePayload: JudgeEvidenceInput[] = selectDiverseEvidence(c.evidence, 15)
       .map((ev) => ({
         source: ev.source,
         date: ev.created_utc ? new Date(ev.created_utc * 1000).toISOString().slice(0, 10) : "undated",
@@ -269,8 +366,8 @@ export async function validateClusters(
               distinctAuthors: c.distinctAuthors,
               platforms: c.platforms,
               engagement: c.engagement,
-              voices: c.voices,
               recencyRatio: Number(c.recencyRatio.toFixed(2)),
+              datedRatio: Number(c.datedRatio.toFixed(2)),
               topThreadShare: Number(c.topItemShare.toFixed(2)),
               paidIntentPosts: c.paid?.count ?? 0,
               paidMedianBudgetUsd: c.paid?.medianBudgetUsd ?? 0,
@@ -285,7 +382,6 @@ export async function validateClusters(
         ZJudge
       );
       run("UPDATE clusters SET judge_json=? WHERE id=?", JSON.stringify(data), c.id);
-      engine = "ai";
       judgedCount++;
       onProgress(judgedCount, toJudge.length);
     } catch (err) {
@@ -305,7 +401,8 @@ export async function validateClusters(
       get<{ judge_json: string | null }>("SELECT judge_json FROM clusters WHERE id=?", c.id)?.judge_json
     );
 
-    const voicesScore = Math.min(1, Math.log10(c.voices + 1) / 4); // 10k voices ≈ 1.0
+    const peopleScore = Math.min(1, Math.log10(c.distinctAuthors + 1) / Math.log10(201));
+    const engagementScore = Math.min(1, Math.log10(c.engagement + 1) / 4);
     const platformScore = Math.min(1, c.platforms.length / 4);
     const recencyScore = c.recencyRatio;
     const growthScore = Math.min(1, Math.max(0, c.growth));
@@ -318,28 +415,38 @@ export async function validateClusters(
     if (judge) {
       demandScore =
         100 *
-        (0.26 * voicesScore +
-          0.12 * platformScore +
-          0.11 * recencyScore +
-          0.12 * growthScore +
+        (0.22 * peopleScore +
+          0.14 * engagementScore +
+          0.1 * platformScore +
+          0.1 * recencyScore +
+          0.08 * growthScore +
           0.14 * (judge.painIntensity / 10) +
-          0.13 * (judge.wtpEvidence / 10) +
+          0.1 * (judge.wtpEvidence / 10) +
           0.12 * paidScore);
     } else {
       demandScore =
-        100 * (0.4 * voicesScore + 0.14 * platformScore + 0.17 * recencyScore + 0.17 * growthScore + 0.12 * paidScore);
+        100 *
+        (0.34 * peopleScore +
+          0.2 * engagementScore +
+          0.14 * platformScore +
+          0.14 * recencyScore +
+          0.08 * growthScore +
+          0.1 * paidScore);
     }
 
     const aiRejected = judge?.verdict === "rejected";
-    const validated = c.gatePassed && !aiRejected;
+    const aiValidated = judge?.verdict === "validated";
+    const validated = c.gatePassed && aiValidated;
     const t = settings.tiers;
     const tier = aiRejected
       ? "rejected"
+      : c.gatePassed && !judge
+        ? "unjudged"
       : !validated
         ? "insufficient"
-        : c.voices >= t.goldVoices && c.platforms.length >= t.goldPlatforms
+        : c.distinctAuthors >= t.goldAuthors && c.platforms.length >= t.goldPlatforms
           ? "gold"
-          : c.voices >= t.silverVoices
+          : c.distinctAuthors >= t.silverAuthors
             ? "silver"
             : "bronze";
     if (validated) validatedCount++;
@@ -369,5 +476,13 @@ export async function validateClusters(
   }
 
   log(`demand gate: ${validatedCount} validated of ${computed.length} clusters (${judgedCount} AI-judged)`);
+  const engine =
+    toJudge.length === 0
+      ? "none"
+      : judgedCount === toJudge.length
+        ? "ai"
+        : judgedCount > 0
+          ? "mixed"
+          : "heuristic";
   return { validated: validatedCount, engine };
 }

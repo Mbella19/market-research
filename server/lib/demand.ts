@@ -41,6 +41,8 @@ export interface NormalizedEngagement {
   platformCapApplied: boolean;
   /** Share of counted engagement carried by the single biggest item (0..1). */
   topItemShare: number;
+  /** Final counted contribution by source, after every cap. */
+  bySource: Record<string, number>;
 }
 
 export function normalizeEngagement(items: EngagementItem[]): NormalizedEngagement {
@@ -58,8 +60,12 @@ export function normalizeEngagement(items: EngagementItem[]): NormalizedEngageme
     .map((w) => w.value)
     .filter((v) => v > 0)
     .sort((a, b) => a - b);
-  const median = nonzero.length ? nonzero[Math.floor(nonzero.length / 2)]! : 0;
-  const itemCap = Math.max(60, Math.min(median * 3, normalized * 0.35));
+  const median = nonzero.length
+    ? nonzero.length % 2
+      ? nonzero[Math.floor(nonzero.length / 2)]!
+      : (nonzero[nonzero.length / 2 - 1]! + nonzero[nonzero.length / 2]!) / 2
+    : 0;
+  const itemCap = Math.min(median * 3, normalized * 0.35);
   let viralCapApplied = false;
   const capped = weighted.map((w) => {
     if (w.value > itemCap) {
@@ -73,19 +79,27 @@ export function normalizeEngagement(items: EngagementItem[]): NormalizedEngageme
   // contribute more than 60% of counted engagement (x ≤ 1.5 × rest).
   const perSource = new Map<string, number>();
   for (const w of capped) perSource.set(w.source, (perSource.get(w.source) ?? 0) + w.value);
+  const originalPerSource = new Map(perSource);
   let platformCapApplied = false;
+  const sourceScale = new Map<string, number>();
+  for (const source of perSource.keys()) sourceScale.set(source, 1);
   if (perSource.size >= 2) {
-    for (const [src, v] of perSource) {
-      const rest = [...perSource.entries()].reduce((s, [k, x]) => (k === src ? s : s + x), 0);
+    for (const [src, v] of originalPerSource) {
+      const rest = [...originalPerSource.entries()].reduce((s, [k, x]) => (k === src ? s : s + x), 0);
       const maxAllowed = 1.5 * rest;
       if (rest > 0 && v > maxAllowed) {
         perSource.set(src, maxAllowed);
+        sourceScale.set(src, maxAllowed / v);
         platformCapApplied = true;
       }
     }
   }
-  const counted = [...perSource.values()].reduce((s, v) => s + v, 0);
-  const topItem = capped.reduce((m, w) => Math.max(m, w.value), 0);
+  const finalItems = capped.map((item) => ({
+    ...item,
+    value: item.value * (sourceScale.get(item.source) ?? 1),
+  }));
+  const counted = finalItems.reduce((sum, item) => sum + item.value, 0);
+  const topItem = finalItems.reduce((m, item) => Math.max(m, item.value), 0);
 
   return {
     raw,
@@ -94,11 +108,13 @@ export function normalizeEngagement(items: EngagementItem[]): NormalizedEngageme
     viralCapApplied,
     platformCapApplied,
     topItemShare: counted > 0 ? Math.min(1, topItem / counted) : 0,
+    bySource: Object.fromEntries([...perSource].map(([source, value]) => [source, Math.round(value)])),
   };
 }
 
 export interface PaidIntentSummary {
   count: number;
+  budgetCount?: number;
   totalBudgetUsd: number;
   medianBudgetUsd: number;
 }

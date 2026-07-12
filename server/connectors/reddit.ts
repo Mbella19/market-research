@@ -317,7 +317,7 @@ export const reddit: Connector = {
       }
     }
 
-    // ---- comment mining: hot threads carry dozens more distinct voices ----
+    // ---- comment mining: hot threads add independently authored evidence ----
     const hotThreads = items
       .filter((it) => it.comments >= 15)
       .sort((a, b) => b.score + b.comments - (a.score + a.comments))
@@ -380,10 +380,12 @@ export const reddit: Connector = {
           score: d.score,
           comments: d.comments,
           createdUtc: d.createdUtc,
-          meta: {
-            kind: "paid-intent",
-            subreddit: sub,
-            budgetUsd: budget?.amountUsd ?? null,
+            meta: {
+              kind: "paid-intent",
+              subreddit: sub,
+              budgetAmount: budget?.amount ?? null,
+              budgetCurrency: budget?.currency ?? null,
+              budgetUsd: budget?.amountUsd ?? null,
             budgetKind: budget?.kind ?? null,
             budgetRaw: budget?.raw ?? null,
           },

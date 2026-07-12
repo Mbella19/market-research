@@ -38,6 +38,9 @@ export const stackexchange: Connector = {
       .filter((q): q is string => Boolean(q))
       .slice(0, 4);
     if (queries.length === 0 && ctx.topic) queries.push(ctx.topic);
+    if (queries.length === 0) {
+      queries.push("software recommendation", "looking for software", "is there a tool", "alternative app");
+    }
 
     for (const site of sites) {
       for (const q of queries) {

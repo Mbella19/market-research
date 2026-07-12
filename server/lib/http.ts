@@ -1,6 +1,7 @@
 import { get, run } from "../db.ts";
 import { sha256 } from "./text.ts";
 import { throttled } from "./ratelimit.ts";
+import { redactSecrets, redactUrl } from "./secrets.ts";
 
 const BROWSER_UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
@@ -24,7 +25,10 @@ export class HttpError extends Error {
     public url: string,
     public bodySnippet: string
   ) {
-    super(`HTTP ${status} for ${url}`);
+    const safeUrl = redactUrl(url);
+    super(`HTTP ${status} for ${safeUrl}`);
+    this.url = safeUrl;
+    this.bodySnippet = redactSecrets(bodySnippet);
   }
 }
 
@@ -36,20 +40,36 @@ function cacheGet(key: string, ttlMs: number): string | null {
     key
   );
   if (!row) return null;
-  if (Date.now() - row.ts > ttlMs) return null;
+  if (Date.now() - row.ts > ttlMs) {
+    run("DELETE FROM http_cache WHERE key = ?", key);
+    return null;
+  }
   return row.body;
 }
 
+let cacheWritesSinceCleanup = 0;
+
 function cachePut(key: string, url: string, status: number, body: string): void {
+  // Do not let a single unexpectedly large upstream response bloat the DB.
+  if (Buffer.byteLength(body, "utf8") > 2_000_000) return;
   run(
     "INSERT INTO http_cache (key, url, status, body, ts) VALUES (?, ?, ?, ?, ?) " +
-      "ON CONFLICT(key) DO UPDATE SET body = excluded.body, status = excluded.status, ts = excluded.ts",
+      "ON CONFLICT(key) DO UPDATE SET url = excluded.url, body = excluded.body, status = excluded.status, ts = excluded.ts",
     key,
-    url,
+    redactUrl(url),
     status,
     body,
     Date.now()
   );
+  cacheWritesSinceCleanup++;
+  if (cacheWritesSinceCleanup >= 25) {
+    cacheWritesSinceCleanup = 0;
+    const now = Date.now();
+    run("DELETE FROM http_cache WHERE ts < ?", now - 7 * 86400_000);
+    run(
+      "DELETE FROM http_cache WHERE key IN (SELECT key FROM http_cache ORDER BY ts DESC LIMIT -1 OFFSET 250)"
+    );
+  }
 }
 
 export async function fetchText(url: string, opts: FetchOpts = {}): Promise<string> {

@@ -4,6 +4,7 @@ import { parseBudget, isHiringPost, matchScore, buildVocab } from "../lib/paidin
 import { normalizeEngagement, paidIntentScore, SOURCE_ENGAGEMENT_WEIGHT } from "../lib/demand.ts";
 import { containsVerbatim, tokenize, hashAuthor } from "../lib/text.ts";
 import { nearDuplicateIndexes } from "../lib/dedupe.ts";
+import { fingerprint, cosine, DUPLICATE_THRESHOLD } from "../lib/similarity.ts";
 
 describe("parseBudget", () => {
   test("fixed budget", () => {
@@ -93,6 +94,16 @@ describe("normalizeEngagement", () => {
     assert.ok(res.platformCapApplied, "platform cap should trigger");
     const hn = 50 * SOURCE_ENGAGEMENT_WEIGHT.hn!;
     assert.ok(res.counted <= hn + 1.5 * hn + 1, `reddit share should be ≤1.5× rest (counted=${res.counted})`);
+    const sourceTotal = Object.values(res.bySource).reduce((sum, value) => sum + value, 0);
+    assert.ok(Math.abs(sourceTotal - res.counted) <= 1);
+  });
+  test("top-item share is calculated after platform scaling", () => {
+    const res = normalizeEngagement([
+      { source: "reddit", engagement: 5000 },
+      ...Array.from({ length: 10 }, () => ({ source: "reddit", engagement: 20 })),
+      { source: "hn", engagement: 100 },
+    ]);
+    assert.ok(res.topItemShare < 0.5, `final top share should reflect all caps, got ${res.topItemShare}`);
   });
   test("empty input", () => {
     const res = normalizeEngagement([]);
@@ -145,6 +156,40 @@ describe("hashAuthor", () => {
     assert.notEqual(hashAuthor("reddit", "SomeUser"), hashAuthor("hn", "SomeUser"));
     assert.equal(hashAuthor("reddit", "[deleted]"), null);
     assert.equal(hashAuthor("reddit", "AutoModerator"), null);
+  });
+});
+
+describe("opportunity duplicate detection (cross-scan)", () => {
+  const hassmedic = fingerprint([
+    "Home Assistant integrations break repeatedly",
+    "Home Assistant users waste time on brittle integrations, recurring reauthentication, expired tokens, unavailable devices",
+    "smart home automation",
+    "Home Assistant power users",
+  ]);
+  const bridgesentry = fingerprint([
+    "Home automation integrations lose data",
+    "Home Assistant users lose energy prices, sensor entities, and Echo device access when third-party integrations break after upgrades",
+    "smart home automation",
+    "Home Assistant users",
+  ]);
+  const invoicing = fingerprint([
+    "Invoice chasing drains cash flow",
+    "Freelancers lose time and cash flow when clients pay late, ghost invoices, or force repeated follow-up",
+    "invoicing & payments",
+    "freelancers and finance teams",
+  ]);
+  test("same problem from two scans exceeds the threshold", () => {
+    const sim = cosine(hassmedic, bridgesentry);
+    assert.ok(sim >= DUPLICATE_THRESHOLD, `expected ≥${DUPLICATE_THRESHOLD}, got ${sim.toFixed(3)}`);
+  });
+  test("different problems stay far below it", () => {
+    const sim = cosine(hassmedic, invoicing);
+    assert.ok(sim < 0.2, `expected <0.2, got ${sim.toFixed(3)}`);
+  });
+  test("stemming bridges break/breakage/breaking", () => {
+    const a = fingerprint(["integrations breaking constantly"]);
+    const b = fingerprint(["integration breakage is constant"]);
+    assert.ok(cosine(a, b) > 0.5);
   });
 });
 

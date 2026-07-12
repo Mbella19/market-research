@@ -1,101 +1,134 @@
 # Lodestone
 
-**Evidence-based market research.** Lodestone hunts for real problems people repeatedly complain about across the public internet, validates whether the demand is real (hundreds/thousands of voices — not three excited comments), and turns only the strongest validated problems into founder-grade software opportunity briefs.
+Lodestone is an evidence-based market-research receiver. It harvests public complaints, extracts concrete software problems, groups them, and certifies only clusters that pass measurable coverage thresholds and an explicit skeptical AI-judge verdict.
 
-It is deliberately **not** an idea generator. Every claim traces to quoted, linked, real posts. If evidence is thin, it says "insufficient evidence." If a cluster is one viral thread wearing a trenchcoat, the AI demand judge rejects it and shows you why.
+It does not treat engagement as people, infer a market size from posts, or claim that complaints prove pricing. Every brief keeps payment and customer validation as later rungs.
 
----
+## Requirements and startup
 
-## Run it
+- Node.js 22.5 or newer; npm 10 or newer
+- A logged-in Codex CLI for AI analysis (no OpenAI API key is required)
+- Optional source credentials listed in [.env.example](.env.example)
 
 ```bash
 npm install
-npm run dev:server   # API on http://127.0.0.1:5058
+npm run dev          # API + local operator UI
+npm run dev:server   # API only, http://127.0.0.1:5058
+npm test
+npm run build
 ```
 
 Production mode:
 
 ```bash
-npm start            # http://127.0.0.1:5058
+npm start
 ```
 
-## The AI core
+Runtime data is local in `data/`. Lodestone forces private directory/file permissions on POSIX systems, redacts credentials from stored URLs/events, bounds its HTTP cache, and listens only on `127.0.0.1` by default. Rotate any credential that was exposed outside Lodestone; local redaction cannot rotate a provider key.
 
-Lodestone shells out to your **Codex CLI** (`codex exec`, model **gpt-5.5**) as its reasoning engine — no OpenAI API key needed, it rides your ChatGPT login:
+## AI pipeline
 
-- **plan** — expands a niche into pain-hunting queries per source
-- **extract** — reads every harvested item: real pain or noise, severity, willingness-to-pay, verbatim quote (quotes are substring-verified against the source; unverifiable quotes are replaced with real excerpts)
-- **cluster** — merges TF-IDF candidate groups into named problem clusters
-- **judge** (xhigh) — skeptical demand analyst; can reject gate-passing clusters (one-thread wonders, free-product whining, already-solved problems)
-- **brief** (xhigh) — opportunity report: concept, ICP, MVP, differentiation, monetization, GTM, risks, competitors, evidence trail
-- **ask** — "Ask the evidence" Q&A on any cluster, citations included
+Lodestone invokes `codex exec --ignore-user-config` with GPT-5.6 Sol (`gpt-5.6-sol`) at `xhigh` reasoning effort for every AI stage by default. It uses a minimal environment, read-only sandbox, ephemeral session, and disables shell/browser/computer/plugin/app/web-search tools. Internet content is explicitly delimited as untrusted data and all task outputs must pass strict schemas.
 
-Per-stage reasoning effort is configurable in **Settings** (default: high for bulk work, xhigh for judging/briefs). If Codex is unavailable (usage limit, logged out), scans **fall back to a labeled heuristic engine** — never silently — and a **Re-analyze** action re-runs stored items through the AI later.
+- `plan` — source-specific pain queries
+- `extract` — one exact result per item, severity, willingness-to-pay class, and substring-verified quote
+- `cluster` — local TF-IDF grouping plus AI coherence/refinement
+- `judge` — skeptical demand verdict for gate-passers
+- `brief` — evidence-grounded, solo-buildable opportunity report
+- `ask` — cluster-bounded answers whose citations must come from the supplied evidence set
 
-> **Machine-specific workaround:** your `~/.codex/config.toml` contains `service_tier = "priority"`, which codex-cli 0.130.0 can't parse — plain `codex` commands die on startup. Lodestone always invokes `codex exec --ignore-user-config` with explicit flags, so it is immune. (Fix your terminal codex by removing that line or upgrading the CLI.)
+Long posts use a structured excerpt (head, pain-bearing sentences, and tail), not a fixed first-700-character cut. Missing AI item IDs receive a labeled heuristic fallback. Incoherent AI clusters are quarantined instead of persisted. A gate-passer is `unjudged`, never validated, if its judge call is absent or invalid.
 
-## Sources (11)
+If AI is unavailable, deterministic work remains explicitly labeled `heuristic` or `mixed`; no heuristic-only run can mint a validated brief. Re-analysis clones stored raw items into a versioned child scan, so a failure cannot erase the prior analysis.
 
-| Source | Access | Notes |
+Each scan stores a secret-free configuration snapshot plus pipeline, prompt, and metric versions.
+
+## Pain sources
+
+| Source | Access | Role |
 |---|---|---|
-| Reddit | **no key** — custom scraper | `.json` fast path; when Reddit 403s it merges RSS (content) + old.reddit HTML (`data-score`/`data-comments-count`) |
-| Hacker News | no key (Algolia) | stories + comments + Ask HN |
-| GitHub Issues | your PAT | feature requests, 👍 reactions = demand |
-| Stack Exchange | no key | incl. softwarerecs — people literally asking for software |
-| Lemmy | no key | lemmy.world search |
-| YouTube | your Data API key | comment mining; falls back to keyless InnerTube |
-| Google Play | no key | 1–3★ reviews of category apps |
-| Apple App Store | no key | iTunes RSS 1–3★ reviews |
-| Product Hunt | no key (RSS) | competitive context for briefs, never counted as pain |
-| X / Twitter | your bearer token | up to 8 pain queries × 3 pages each (recent search covers the last 7 days) + 24h cache |
-| G2 Landscape | your API token | data.g2.com v2 (Bearer): category search → market leaders (rating, review count, pricing) as competitive context; per-product review text is partner-gated |
+| Reddit | no key | posts plus budget-bearing hiring/task posts |
+| Hacker News | no key | stories, comments, Ask HN |
+| GitHub Issues | PAT | feature requests; only 👍 reactions count positively |
+| Stack Exchange | no key | includes Software Recommendations and discovery defaults |
+| Lemmy | no key | public community search |
+| YouTube | optional Data API key | comment mining with keyless fallback |
+| Google Play | no key | recent 1–3★ reviews |
+| Apple App Store | no key | recent 1–3★ reviews |
+| X / Twitter | bearer token | recent public search |
+| Product Hunt | no key | competitive context only |
+| G2 | API token | competitive context only |
 
-Trend signals: Wikipedia Pageviews (interest proxy) + complaint-frequency timelines computed from the harvested evidence itself.
+An omitted source list uses mode defaults; an explicit empty, duplicate, or invalid list is rejected. Product Hunt and G2 never count as pain-source coverage. Connector warnings that were handled internally still surface as failed coverage when no evidence was delivered.
 
-**Recency by construction:** Reddit/Lemmy search last 12 months, X last 7 days (API limit), App Store + Play Store sorted most-recent, Product Hunt current launches, and GitHub / Stack Exchange / YouTube / HN are cut off at the **Evidence window** (Settings, default 24 months). The demand score explicitly rewards clusters whose complaint frequency is growing in the last 6 months.
+The configurable harvest window defaults to 24 months. Validation separately measures the share from the last 12 months and the share with a known date. Timelines always contain all 24 calendar months, including zeros. Growth compares smoothed, like-for-like six-month windows only for sources with comparable history.
 
-## Trend scout (separate from pain research)
+## Demand gate and scoring
 
-The third scan mode measures pure GROWTH — no pain, no demand gate:
+A cluster is validated only when every configured gate passes and the AI judge returns `validated`:
 
-- **Signals**: GitHub repos < window old gaining stars abnormally fast (star velocity) · Hacker News term momentum (last window vs previous window, full-window slicing) · Product Hunt launch-keyword clusters · Google's daily breakout searches · X trending topics (tier-dependent).
-- **Pipeline**: `scout → classify → rank → report`. Signals group across sources; the AI names/describes each candidate and REJECTS anything not rideable with pure software (hardware, physical products, news, celebrities, sports). Its only powers are naming and rejecting — momentum comes from the numbers.
-- **Momentum score**: 0.6 × strongest signal + 0.4 × cross-source spread. Single-source trends cap at 60 ("rising"); "surging" requires multi-platform confirmation.
-- **Build angles**: top software-fit trends get 2-3 solo-buildable product angles (xhigh), framed honestly as bets on the trend — demand stays a separate question, answered by running a niche scan from the trend card.
+- at least 25 distinct observed author hashes
+- at least 2 pain-evidence platforms
+- at least 800 normalized engagement units
+- at least 30% of all evidence from the last 12 months
+- at least 70% of all evidence with a known publication date
 
-## The Demand Gate
+“Observed authors” is not an estimate of people or customers. Engagement is a separate unit. Platform-specific weights are applied, a single item is capped at three times the median and 35% of the normalized cluster total, and one platform cannot carry over 60% when multiple platforms are present. The stored audit data includes raw, normalized, final, by-source, and final top-item-share values.
 
-A cluster is **validated** only when ALL pass (thresholds editable in Settings):
+Validated tiers use observed authors: Gold defaults to 100 authors on 3+ platforms, Silver to 50, and Bronze to other validated clusters. `Insufficient`, `unjudged`, `rejected`, and `legacy` are visibly distinct states.
 
-- distinct complainers ≥ **25**
-- platforms ≥ **2**
-- **normalized** engagement ≥ **800**
-- ≥ **30%** of evidence from the last 12 months
+Only a bounded number of top gate-passers are judged per scan. The remainder stay explicitly `unjudged`; there is no fail-open path.
 
-Engagement is *normalized before counting*: platform units are weighted (a GitHub 👍 ≈ 2.5 reddit-upvote equivalents; an X like ≈ 0.4), any single item is winsorized to ≤3× the median (and ≤35% of the cluster), and with 2+ platforms present no single platform may carry >60% of the counted total — one viral thread can no longer validate a cluster by itself. The gate stores the raw total alongside so nothing is hidden.
+## Paid intent
 
-**Voices** = distinct complainers + normalized engagement. Tiers: 🥇 ≥ 5,000 voices & 3+ platforms · 🥈 ≥ 1,500 · 🥉 passes gate — all labeled "pain validated", deliberately. The AI judge can still reject a gate-passer — and its reasons are shown.
+Reddit `[Hiring]` and `[Task]` posts are retained separately from complaint evidence. A scored match must:
 
-## Paid intent & the validation ladder
+- contain an actual parsed budget
+- share multiple meaningful terms, including a cluster-rare term
+- clear a weighted confidence threshold
+- clearly beat the runner-up cluster
 
-Complaints prove pain, not payment. Two mechanisms keep that distinction honest:
+Each post can strengthen at most one cluster. Currency and time basis are retained. Only comparable fixed USD budgets contribute to USD total/median summaries; hourly, weekly, monthly, GBP, and EUR amounts are never added as if equivalent.
 
-- **Paid-intent evidence**: the Reddit connector additionally harvests hiring subreddits (r/forhire, r/slavelabour, …) for `[Hiring]`/`[Task]` posts, parses posted budgets, and matches them to clusters by vocabulary overlap. Matched posts appear as a separate axis (never mixed into engagement), feed 12% of the demand score, and show on the cluster as "paid intent ×N · ~$median".
-- **Validation ladder** on every cluster and brief: ☑ online pain validated → ☑/☐ paid intent detected → ☐ customer interviews → ☐ landing-page interest → ☐ pre-orders. Brief pricing is explicitly labeled a hypothesis; the ladder names the rung that would test it.
+Paid intent is one scoring axis, not proof of product pricing. Briefs label pricing as a hypothesis and show the remaining customer-interview, landing-page, and paid-pilot rungs.
 
-Scans also report **source coverage** ("9/11 sources delivered" + what failed) so a validation is never read against silently missing sources, and interrupted scans are marked as such on server restart (Re-analyze resumes from stored items).
+## Trend scout
 
-## Layout
+Trend scans are separate from pain validation. They measure GitHub star velocity, Hacker News window-over-window terms, Product Hunt launch clusters, Google breakout searches, and X trends.
 
+Signals are grouped with complete-link similarity to prevent transitive mega-clusters. The two-character focus `AI` is supported. Raw per-signal strength and detail, source count, and aggregate strength are persisted.
+
+Momentum combines strongest signal (50%), mean signal strength (20%), and cross-source confirmation (30%). A single-source candidate can be rising but never surging. AI names and filters candidates; it does not create the momentum score. If AI is disabled, evidence is stored with heuristic labels and automatic build-angle calls are skipped.
+
+Build angles remain trend bets, not validated demand. Use “Validate demand with a niche scan” before treating one as an opportunity.
+
+## Data integrity and historical results
+
+Pipeline v2 uses fail-closed schemas and corrected metric semantics. Pre-v2 clusters/trends are marked `legacy`; legacy clusters are not certifications and should be re-analyzed. Brief IDs are stable across regeneration.
+
+SQLite migrations are explicit and fail on unexpected errors. Cluster persistence and brief upserts are transactional, opportunities are unique per cluster, scan deletion cleans its events, startup bounds stale cache rows, and SIGINT/SIGTERM abort background scans before closing the database.
+
+## Repository layout
+
+```text
+server/
+  ai/          Codex runner, prompts, schemas
+  connectors/  pain and market-context receivers
+  lib/         scoring, matching, security, selection helpers
+  pipeline/    plan → harvest → extract → cluster → validate → synthesize
+  tests/       analytical and security invariants
+web/           local operator interface (intentionally gitignored here)
+data/          local SQLite/cache/temp data (gitignored)
 ```
-server/            Fastify API + pipeline (TypeScript, node:sqlite — zero native deps)
-  ai/              codex runner, prompts, JSON schemas
-  connectors/      11 sources + trends
-  pipeline/        plan → harvest → extract → cluster → validate → synthesize
-data/              SQLite DB + tmp (gitignored)
-.env               your keys (gitignored)
+
+This public repository intentionally tracks the backend only. If the operator UI needs collaboration or history, put `web/` in a separate private repository; do not remove it from this public repo’s ignore policy.
+
+Useful probes:
+
+```bash
+npx tsx server/scripts/probe-connectors.ts [source...]
+FOCUS=AI npx tsx server/scripts/probe-trends.ts [source...]
+npx tsx server/scripts/smoke-ai.ts [effort]
 ```
 
-> **Public repo note:** this repository is the backend only — the operator interface (`web/`, local), `.env`, and all data are intentionally excluded and stay private.
-
-Handy scripts: `npx tsx server/scripts/probe-connectors.ts [source…]` (live-test connectors), `npx tsx server/scripts/probe-trends.ts [source…]` (live-test trend sources), `npx tsx server/scripts/smoke-ai.ts [effort]` (real Codex call). `npm test` runs the analytical-core unit suite (budget parsing, engagement normalization/caps, quote verification, dedupe).
+The connector probe uses the same 1,500-item Standard-depth budget as the application unless `PROBE_BUDGET` is set.

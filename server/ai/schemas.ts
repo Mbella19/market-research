@@ -1,11 +1,11 @@
 import { z } from "zod";
 
 /**
- * Each AI task has a zod validator (lenient: coerces/clamps model sloppiness)
- * plus a strict JSON Schema handed to `codex exec --output-schema`.
+ * Each AI task has a strict zod validator plus a JSON Schema for the model.
+ * Invalid or incomplete output is repaired/retried rather than silently defaulted.
  */
 
-const strArr = z.array(z.string()).catch([]);
+const strArr = z.array(z.string().trim().min(1).max(500)).max(50);
 const jsStrArr = { type: "array", items: { type: "string" } };
 
 // ---------- plan ----------
@@ -19,7 +19,7 @@ export const ZPlan = z.object({
   storeTerms: strArr,
   youtubeQueries: strArr,
   wikipediaEntities: strArr,
-});
+}).strict();
 export type QueryPlan = z.infer<typeof ZPlan>;
 
 export const JPlan = {
@@ -49,17 +49,31 @@ export const JPlan = {
 
 // ---------- extract ----------
 
-export const ZExtractResult = z.object({
-  id: z.coerce.number().int(),
-  isPain: z.boolean().catch(false),
-  statement: z.string().catch(""),
-  category: z.string().catch("general"),
-  persona: z.string().catch("unknown"),
-  severity: z.coerce.number().int().min(1).max(5).catch(3),
-  wtp: z.enum(["none", "hinted", "explicit"]).catch("none"),
-  quote: z.string().catch(""),
-});
-export const ZExtract = z.object({ results: z.array(ZExtractResult).catch([]) });
+export const ZExtractResult = z
+  .object({
+    id: z.number().int(),
+    isPain: z.boolean(),
+    statement: z.string().max(500),
+    category: z.string().max(100),
+    persona: z.string().max(200),
+    severity: z.number().int().min(1).max(5),
+    wtp: z.enum(["none", "hinted", "explicit"]),
+    quote: z.string().max(300),
+  })
+  .strict()
+  .superRefine((result, ctx) => {
+    if (result.isPain && (!result.statement.trim() || !result.category.trim() || !result.persona.trim())) {
+      ctx.addIssue({ code: "custom", message: "pain results require statement, category, and persona" });
+    }
+    if (
+      !result.isPain &&
+      (result.statement !== "" || result.category !== "" || result.persona !== "" || result.quote !== "" ||
+        result.severity !== 1 || result.wtp !== "none")
+    ) {
+      ctx.addIssue({ code: "custom", message: "non-pain results must use the documented empty defaults" });
+    }
+  });
+export const ZExtract = z.object({ results: z.array(ZExtractResult).max(100) }).strict();
 export type ExtractResult = z.infer<typeof ZExtractResult>;
 
 export const JExtract = {
@@ -94,16 +108,16 @@ export const ZClusterRefine = z.object({
   clusters: z
     .array(
       z.object({
-        memberIds: z.array(z.coerce.number().int()).catch([]),
-        name: z.string().catch(""),
-        summary: z.string().catch(""),
-        category: z.string().catch("general"),
-        persona: z.string().catch("unknown"),
-        coherent: z.boolean().catch(true),
-      })
+        memberIds: z.array(z.number().int()).min(1).max(40),
+        name: z.string().trim().min(1).max(160),
+        summary: z.string().max(1200),
+        category: z.string().trim().min(1).max(100),
+        persona: z.string().trim().min(1).max(200),
+        coherent: z.boolean(),
+      }).strict()
     )
-    .catch([]),
-});
+    .max(40),
+}).strict();
 export type ClusterRefine = z.infer<typeof ZClusterRefine>;
 
 export const JClusterRefine = {
@@ -133,14 +147,14 @@ export const JClusterRefine = {
 // ---------- demand judge ----------
 
 export const ZJudge = z.object({
-  painIntensity: z.coerce.number().min(0).max(10).catch(5),
-  wtpEvidence: z.coerce.number().min(0).max(10).catch(3),
-  verdict: z.enum(["validated", "rejected"]).catch("validated"),
-  reasons: strArr,
-  buyerPersona: z.string().catch(""),
-  competition: z.string().catch(""),
-  whyNow: z.string().catch(""),
-});
+  painIntensity: z.number().min(0).max(10),
+  wtpEvidence: z.number().min(0).max(10),
+  verdict: z.enum(["validated", "rejected"]),
+  reasons: strArr.min(1).max(6),
+  buyerPersona: z.string().max(500),
+  competition: z.string().max(800),
+  whyNow: z.string().max(500),
+}).strict();
 export type JudgeVerdict = z.infer<typeof ZJudge>;
 
 export const JJudge = {
@@ -169,21 +183,21 @@ export const JJudge = {
 // ---------- opportunity brief ----------
 
 export const ZBrief = z.object({
-  title: z.string(),
-  oneLiner: z.string().catch(""),
-  problem: z.string().catch(""),
-  targetUser: z.string().catch(""),
-  mvpFeatures: strArr,
-  differentiation: z.string().catch(""),
-  monetization: z.string().catch(""),
-  gtm: strArr,
-  risks: strArr,
+  title: z.string().trim().min(3).max(200),
+  oneLiner: z.string().trim().min(10).max(500),
+  problem: z.string().trim().min(20).max(2000),
+  targetUser: z.string().trim().min(5).max(1000),
+  mvpFeatures: strArr.min(3).max(8),
+  differentiation: z.string().trim().min(10).max(1500),
+  monetization: z.string().trim().min(10).max(1000),
+  gtm: strArr.min(2).max(8),
+  risks: strArr.min(1).max(8),
   competitors: z
-    .array(z.object({ name: z.string().catch(""), note: z.string().catch("") }))
-    .catch([]),
-  whyNow: z.string().catch(""),
-  successMetrics: strArr,
-});
+    .array(z.object({ name: z.string().trim().min(1).max(200), note: z.string().max(600) }).strict())
+    .max(8),
+  whyNow: z.string().max(500),
+  successMetrics: strArr.min(2).max(6),
+}).strict();
 export type Brief = z.infer<typeof ZBrief>;
 
 export const JBrief = {
@@ -233,16 +247,16 @@ export const ZTrendClassify = z.object({
   trends: z
     .array(
       z.object({
-        id: z.coerce.number().int(),
-        name: z.string().catch(""),
-        category: z.string().catch("general"),
-        summary: z.string().catch(""),
-        softwareFit: z.enum(["strong", "possible", "rejected"]).catch("possible"),
-        fitReason: z.string().catch(""),
-      })
+        id: z.number().int(),
+        name: z.string().trim().min(1).max(160),
+        category: z.string().trim().min(1).max(100),
+        summary: z.string().max(1000),
+        softwareFit: z.enum(["strong", "possible", "rejected"]),
+        fitReason: z.string().max(600),
+      }).strict()
     )
-    .catch([]),
-});
+    .max(50),
+}).strict();
 export type TrendClassify = z.infer<typeof ZTrendClassify>;
 
 export const JTrendClassify = {
@@ -275,14 +289,15 @@ export const ZTrendAngles = z.object({
   angles: z
     .array(
       z.object({
-        title: z.string().catch(""),
-        oneLiner: z.string().catch(""),
-        mvp: z.string().catch(""),
-        trendFit: z.string().catch(""),
-      })
+        title: z.string().trim().min(3).max(200),
+        oneLiner: z.string().trim().min(10).max(500),
+        mvp: z.string().trim().min(10).max(1000),
+        trendFit: z.string().trim().min(10).max(600),
+      }).strict()
     )
-    .catch([]),
-});
+    .min(2)
+    .max(3),
+}).strict();
 export type TrendAngles = z.infer<typeof ZTrendAngles>;
 
 export const JTrendAngles = {
@@ -310,9 +325,9 @@ export const JTrendAngles = {
 // ---------- ask the evidence ----------
 
 export const ZAsk = z.object({
-  answer: z.string(),
-  citedItemIds: z.array(z.coerce.number().int()).catch([]),
-});
+  answer: z.string().trim().min(1).max(4000),
+  citedItemIds: z.array(z.number().int()).max(25),
+}).strict();
 export type AskAnswer = z.infer<typeof ZAsk>;
 
 export const JAsk = {
